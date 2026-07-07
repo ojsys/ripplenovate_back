@@ -1,0 +1,106 @@
+{% extends "admin/base_site.html" %}
+{% load i18n ril_admin log %}
+
+{% block bodyclass %}{{ block.super }} dashboard rip-dashboard{% endblock %}
+
+{% block content %}
+{% ril_dashboard_stats as s %}
+<div class="rip-dash">
+
+  <div class="rip-hero">
+    <div>
+      <div class="rip-hero-eyebrow">Console</div>
+      <h1 class="rip-hero-title">Welcome{% if request.user.full_name %}, {{ request.user.full_name }}{% endif %}.</h1>
+      <p class="rip-hero-sub">A live snapshot of everything moving through Ripple Innovation Labs.</p>
+    </div>
+    <a class="rip-hero-cta" href="{% url 'admin:projects_project_changelist' %}">Open delivery board →</a>
+  </div>
+
+  <div class="rip-tiles">
+    <a class="rip-tile" href="{% url 'admin:projects_project_changelist' %}">
+      <div class="rip-tile-num">{{ s.active }}</div>
+      <div class="rip-tile-lbl">Active projects</div>
+    </a>
+    <a class="rip-tile" href="{% url 'admin:projects_project_changelist' %}?stage__exact=Submitted">
+      <div class="rip-tile-num rip-amber">{{ s.awaiting_quote }}</div>
+      <div class="rip-tile-lbl">Awaiting quote</div>
+    </a>
+    <a class="rip-tile" href="{% url 'admin:projects_project_changelist' %}?stage__exact=Paid">
+      <div class="rip-tile-num rip-green">{{ s.ready_assign }}</div>
+      <div class="rip-tile-lbl">Ready to assign</div>
+    </a>
+    <a class="rip-tile" href="{% url 'admin:projects_project_changelist' %}">
+      <div class="rip-tile-num">{{ s.contracted_fmt }}</div>
+      <div class="rip-tile-lbl">Contracted value</div>
+    </a>
+    <a class="rip-tile" href="{% url 'admin:accounts_user_changelist' %}?role__exact=developer">
+      <div class="rip-tile-num">{{ s.developers }}</div>
+      <div class="rip-tile-lbl">Developers</div>
+    </a>
+    <a class="rip-tile" href="{% url 'admin:accounts_user_changelist' %}?role__exact=client">
+      <div class="rip-tile-num">{{ s.clients }}</div>
+      <div class="rip-tile-lbl">Clients</div>
+    </a>
+  </div>
+
+  <div class="rip-grid">
+    <div class="rip-manage">
+      <div class="rip-section-title">Manage</div>
+      {% if app_list %}
+        {% for app in app_list %}
+          <div class="rip-app">
+            <div class="rip-app-name">{{ app.name }}</div>
+            <div class="rip-model-grid">
+              {% for model in app.models %}
+                <div class="rip-model-card">
+                  <div class="rip-model-top">
+                    {% if model.admin_url %}
+                      <a href="{{ model.admin_url }}" class="rip-model-name">{{ model.name }}</a>
+                    {% else %}
+                      <span class="rip-model-name">{{ model.name }}</span>
+                    {% endif %}
+                    {% if model.add_url %}<a href="{{ model.add_url }}" class="rip-model-add" title="Add">＋</a>{% endif %}
+                  </div>
+                  <div class="rip-model-links">
+                    {% if model.admin_url %}<a href="{{ model.admin_url }}">Open</a>{% endif %}
+                    {% if model.add_url %}<a href="{{ model.add_url }}">Add new</a>{% endif %}
+                  </div>
+                </div>
+              {% endfor %}
+            </div>
+          </div>
+        {% endfor %}
+      {% else %}
+        <p class="rip-empty">{% translate "You don't have permission to view or edit anything." %}</p>
+      {% endif %}
+    </div>
+
+    <div class="rip-activity">
+      <div class="rip-section-title">Recent activity</div>
+      {% get_admin_log 12 as admin_log for_user user %}
+      {% if not admin_log %}
+        <div class="rip-activity-empty">Nothing yet — actions you take will show up here.</div>
+      {% else %}
+        <ul class="rip-log">
+          {% for entry in admin_log %}
+            <li class="{% if entry.is_addition %}rip-log-add{% elif entry.is_change %}rip-log-change{% elif entry.is_deletion %}rip-log-del{% endif %}">
+              <span class="rip-log-dot"></span>
+              <div class="rip-log-body">
+                {% if entry.is_deletion or not entry.get_admin_url %}
+                  <span class="rip-log-obj">{{ entry.object_repr }}</span>
+                {% else %}
+                  <a href="{{ entry.get_admin_url }}" class="rip-log-obj">{{ entry.object_repr }}</a>
+                {% endif %}
+                <div class="rip-log-meta">
+                  {% if entry.content_type %}{{ entry.content_type.name|capfirst }}{% else %}{% translate "Unknown content" %}{% endif %}
+                  · {{ entry.action_time|date:"M j, H:i" }}
+                </div>
+              </div>
+            </li>
+          {% endfor %}
+        </ul>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endblock %}
