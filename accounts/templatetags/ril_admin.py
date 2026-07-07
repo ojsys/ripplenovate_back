@@ -7,6 +7,12 @@ register = template.Library()
 User = get_user_model()
 
 
+@register.filter
+def startswith(value, arg):
+    """{% if request.path|startswith:model.admin_url %} — for active nav state."""
+    return bool(value) and str(value).startswith(str(arg))
+
+
 @register.simple_tag
 def ril_dashboard_stats():
     """Live numbers for the custom admin dashboard tiles."""
