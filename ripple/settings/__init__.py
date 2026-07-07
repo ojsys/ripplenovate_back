@@ -25,7 +25,11 @@ def _detect_environment():
     if not value:
         env_file = _BACKEND_DIR / ".env"
         if env_file.exists():
-            for line in env_file.read_text().splitlines():
+            # Read as UTF-8 (servers may default to an ASCII locale). errors=
+            # "ignore" keeps boot from ever crashing on a stray byte — the
+            # DJANGO_ENV line itself is plain ASCII.
+            text = env_file.read_text(encoding="utf-8", errors="ignore")
+            for line in text.splitlines():
                 line = line.strip()
                 if line.startswith("DJANGO_ENV") and "=" in line:
                     value = line.split("=", 1)[1].strip().strip("\"'")
