@@ -231,6 +231,16 @@
   #content { padding: 26px 40px 64px; }
   #content > h1 { font-family: "Space Grotesk", sans-serif; font-weight: 700; font-size: 26px; letter-spacing: -.02em; margin: 0 0 20px; }
 
+  /* Robust changelist layout — explicit flex so results (left) and filter
+     (right) never collapse, regardless of Django's default float behaviour. */
+  #changelist { display: flex !important; align-items: flex-start; gap: 22px; }
+  #changelist .changelist-form-container { flex: 1 1 auto; min-width: 0; width: auto; }
+  #changelist-filter {
+    flex: 0 0 260px; width: 260px !important; margin: 0 !important;
+    float: none !important; position: static !important; order: 2;
+  }
+  @media (max-width: 900px) { #changelist { flex-direction: column; } #changelist-filter { width: 100% !important; flex-basis: auto; } }
+
   /* Search toolbar */
   #toolbar { background: transparent; border: none; padding: 0 0 16px; }
   #changelist-search #searchbar {
