@@ -1,0 +1,245 @@
+{% extends "admin/base.html" %}
+{% load static %}
+
+{% block title %}{% if subtitle %}{{ subtitle }} | {% endif %}{{ title }} | Ripple Innovation Labs{% endblock %}
+
+{% block extrastyle %}{{ block.super }}
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+<style>
+  /* ============================================================
+     Ripple Innovation Labs — custom admin theme
+     Rebrands Django admin to match the frontend design system.
+     ============================================================ */
+  :root {
+    --rip-green: #0FA37F;
+    --rip-green-dark: #0B8768;
+    --rip-green-text: #0B7D61;
+    --rip-green-soft: #E5F4EE;
+    --rip-ink: #14181C;
+    --rip-bg: #FBFAF8;
+    --rip-card: #FFFFFF;
+    --rip-border: #EDEAE3;
+    --rip-input: #E4E0D8;
+    --rip-muted: #8B93A0;
+    --rip-muted2: #5A6470;
+
+    /* Override Django admin's own variables (applied in light and dark) */
+    --primary: var(--rip-green);
+    --secondary: var(--rip-ink);
+    --accent: var(--rip-green-text);
+    --primary-fg: #fff;
+
+    --body-fg: var(--rip-ink);
+    --body-bg: var(--rip-bg);
+    --body-quiet-color: var(--rip-muted);
+    --body-loud-color: var(--rip-ink);
+
+    --header-color: var(--rip-ink);
+    --header-branding-color: var(--rip-ink);
+    --header-bg: var(--rip-card);
+    --header-link-color: var(--rip-green-text);
+
+    --breadcrumbs-fg: var(--rip-muted2);
+    --breadcrumbs-link-fg: var(--rip-green-text);
+    --breadcrumbs-bg: #F1EFE9;
+
+    --link-fg: var(--rip-green-text);
+    --link-hover-color: var(--rip-green);
+    --link-selected-fg: var(--rip-green);
+
+    --hairline-color: var(--rip-border);
+    --border-color: var(--rip-border);
+
+    --button-bg: var(--rip-green);
+    --button-fg: #fff;
+    --button-hover-bg: var(--rip-green-dark);
+    --default-button-bg: var(--rip-ink);
+    --default-button-hover-bg: #000;
+    --close-button-bg: var(--rip-muted);
+    --close-button-hover-bg: var(--rip-muted2);
+    --delete-button-bg: #C2410C;
+    --delete-button-hover-bg: #9A3412;
+
+    --object-tools-bg: var(--rip-ink);
+    --object-tools-fg: #fff;
+    --object-tools-hover-bg: #000;
+
+    --selected-bg: var(--rip-green-soft);
+    --selected-row: #F3FBF8;
+
+    --message-success-bg: var(--rip-green-soft);
+    --darkened-bg: #F7F5F1;
+    --font-family-primary: "Instrument Sans", system-ui, sans-serif;
+
+    color-scheme: light;
+  }
+
+  html, body { background: var(--rip-bg); font-family: "Instrument Sans", system-ui, sans-serif; }
+
+  /* The theme is a fixed light brand palette — hide Django's dark-mode toggle. */
+  button.theme-toggle { display: none !important; }
+
+  h1, h2, h3, .rip-brand-txt,
+  #content h1, .module h2, .module caption, caption {
+    font-family: "Space Grotesk", sans-serif;
+    letter-spacing: -.01em;
+  }
+
+  /* ---- Header ---- */
+  #header {
+    background: rgba(251,250,248,.9);
+    -webkit-backdrop-filter: blur(12px);
+    backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--rip-border);
+    color: var(--rip-ink);
+    padding: 14px 40px;
+    box-shadow: none;
+  }
+  #branding { display: flex; align-items: center; }
+  .rip-brand { display: inline-flex; align-items: center; gap: 12px; }
+  .rip-logo { width: 30px; height: 30px; flex: none; position: relative; display: inline-block; }
+  .rip-brand-txt { font-weight: 700; font-size: 17px; color: var(--rip-ink); line-height: 1.05; }
+  .rip-brand-txt small {
+    display: block; font-family: "Instrument Sans", sans-serif; font-weight: 600;
+    font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--rip-muted); margin-top: 2px;
+  }
+  #user-tools { color: var(--rip-muted); font-size: 12.5px; text-transform: none; letter-spacing: 0; }
+  #user-tools a { color: var(--rip-green-text); border-bottom: none; font-weight: 600; }
+  #user-tools a:hover { color: var(--rip-green); }
+
+  /* ---- Breadcrumbs ---- */
+  div.breadcrumbs {
+    background: #F1EFE9; color: var(--rip-muted2); padding: 11px 40px; font-size: 12.5px;
+    border-bottom: 1px solid var(--rip-border);
+  }
+  div.breadcrumbs a { color: var(--rip-green-text); font-weight: 600; }
+
+  /* ---- Modules / cards ---- */
+  .module {
+    background: var(--rip-card);
+    border: 1px solid var(--rip-border);
+    border-radius: 16px;
+    overflow: hidden;
+    box-shadow: 0 1px 2px rgba(20,24,28,.03);
+  }
+  .module caption, .module > h2, .module h2 {
+    background: var(--rip-card);
+    color: var(--rip-muted);
+    border-bottom: 1px solid var(--rip-border);
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    font-size: 12px;
+    font-weight: 700;
+    padding: 14px 18px;
+  }
+  .dashboard .module table th { font-weight: 600; }
+  .dashboard .module table td a { font-weight: 600; }
+
+  /* App list rows */
+  .app-list .model-row, tr { }
+  #content-main .module a.addlink,
+  #content-main .module a.changelink { color: var(--rip-green-text); }
+
+  /* ---- Buttons ---- */
+  .button, input[type=submit], input[type=button], .submit-row input, a.button {
+    border-radius: 10px !important;
+    font-weight: 600;
+    padding: 9px 16px;
+    box-shadow: none;
+  }
+  .button:active, input[type=submit]:active { transform: translateY(1px); }
+  .object-tools a, .object-tools a:link, .object-tools a:visited {
+    border-radius: 999px; background: var(--rip-ink); font-weight: 600; text-transform: none;
+    letter-spacing: 0; padding: 8px 16px;
+  }
+  .object-tools a:hover { background: #000; }
+  .object-tools a.addlink { background: var(--rip-green); }
+  .object-tools a.addlink:hover { background: var(--rip-green-dark); }
+
+  /* ---- Tables ---- */
+  #changelist table thead th, .results thead th, table thead th {
+    background: #FAF9F6;
+    color: var(--rip-muted);
+    text-transform: uppercase;
+    font-size: 11px;
+    letter-spacing: .05em;
+    border-bottom: 1px solid var(--rip-border);
+  }
+  #changelist table thead th a { color: var(--rip-muted2); }
+  .results, #changelist-form .results {
+    border: 1px solid var(--rip-border); border-radius: 14px; overflow: hidden;
+  }
+  #changelist table tbody tr:hover { background: #FAF9F6; }
+  #changelist-filter { background: var(--rip-card); border: 1px solid var(--rip-border); border-radius: 14px; }
+  #changelist-filter h2 { background: #FAF9F6; border-radius: 14px 14px 0 0; color: var(--rip-muted); }
+
+  /* ---- Forms ---- */
+  input[type=text], input[type=password], input[type=email], input[type=url],
+  input[type=number], textarea, select, .vTextField {
+    border: 1px solid var(--rip-input);
+    border-radius: 10px;
+    background: #FCFBF9;
+    padding: 9px 12px;
+  }
+  input:focus, textarea:focus, select:focus, .vTextField:focus,
+  input:focus-visible, textarea:focus-visible, select:focus-visible {
+    border-color: var(--rip-green) !important;
+    outline: none !important;
+    box-shadow: 0 0 0 3px rgba(15,163,127,.15);
+  }
+  fieldset.module { border-radius: 16px; }
+  .submit-row { border-radius: 14px; border: 1px solid var(--rip-border); background: var(--rip-card); }
+  .submit-row a.deletelink { border-radius: 10px; }
+
+  a:link, a:visited { color: var(--rip-green-text); }
+  a:hover { color: var(--rip-green); }
+
+  /* Selected / messages */
+  .selected, tr.selected { background: var(--rip-green-soft) !important; }
+  ul.messagelist li.success { background: var(--rip-green-soft); color: var(--rip-green-text); border-radius: 10px; }
+  ul.messagelist li { border-radius: 10px; }
+
+  /* ---- Sidebar nav ---- */
+  #nav-sidebar { background: var(--rip-card); border-right: 1px solid var(--rip-border); }
+  #nav-sidebar .module caption { background: transparent; border: none; }
+  #nav-sidebar a { border-radius: 8px; }
+  #nav-sidebar li.selected a, .toggle-nav-sidebar:hover { color: var(--rip-green); }
+  #toggle-nav-sidebar { border-right: 1px solid var(--rip-border); }
+
+  /* ---- Login page ---- */
+  body.login { background: var(--rip-bg); }
+  body.login #container {
+    background: var(--rip-card); border: 1px solid var(--rip-border);
+    border-radius: 20px; box-shadow: 0 24px 60px -30px rgba(20,24,28,.28);
+    margin-top: 8%; padding-bottom: 8px; overflow: hidden;
+  }
+  body.login #header { background: transparent; border-bottom: 1px solid var(--rip-border); justify-content: center; padding: 22px; }
+  body.login #header .rip-brand { justify-content: center; }
+  body.login .breadcrumbs { display: none; }
+  body.login #content { padding: 26px 30px 6px; }
+  body.login .submit-row { border: none; padding: 0; margin: 0; }
+  body.login .submit-row input {
+    width: 100%; padding: 13px; border-radius: 12px; font-size: 15px;
+  }
+  body.login #content-main { width: 100%; }
+</style>
+{% endblock %}
+
+{% block branding %}
+<div id="site-name">
+  <a href="{% url 'admin:index' %}" class="rip-brand">
+    <span class="rip-logo" aria-hidden="true">
+      <svg viewBox="0 0 30 30" width="30" height="30" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="15" cy="15" r="13" fill="none" stroke="#0FA37F" stroke-width="2" opacity="0.35"/>
+        <circle cx="15" cy="15" r="8.5" fill="none" stroke="#0FA37F" stroke-width="2" opacity="0.65"/>
+        <circle cx="15" cy="15" r="3.6" fill="#0FA37F"/>
+      </svg>
+    </span>
+    <span class="rip-brand-txt">Ripple Innovation Labs<small>Admin console</small></span>
+  </a>
+</div>
+{% endblock %}
+
+{% block nav-global %}{% endblock %}

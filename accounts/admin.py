@@ -1,7 +1,7 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 
-from .models import EmailToken, User
+from .models import EmailToken, SiteSettings, User
 
 
 @admin.register(User)
@@ -28,3 +28,21 @@ class UserAdmin(BaseUserAdmin):
 class EmailTokenAdmin(admin.ModelAdmin):
     list_display = ("token", "user", "purpose", "created_at", "used_at")
     list_filter = ("purpose",)
+
+
+@admin.register(SiteSettings)
+class SiteSettingsAdmin(admin.ModelAdmin):
+    """Singleton: edit the one row; can't add more or delete it."""
+
+    list_display = ("brand_name", "tagline", "updated_at")
+
+    def has_add_permission(self, request):
+        return not SiteSettings.objects.exists()
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def changelist_view(self, request, extra_context=None):
+        # Ensure the row exists so the admin always shows something to edit.
+        SiteSettings.load()
+        return super().changelist_view(request, extra_context)

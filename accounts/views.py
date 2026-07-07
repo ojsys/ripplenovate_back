@@ -9,7 +9,7 @@ from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from .emails import send_password_reset_email, send_verification_email
-from .models import EmailToken
+from .models import EmailToken, SiteSettings
 from .serializers import (
     ChangePasswordSerializer,
     DeveloperCreateSerializer,
@@ -32,6 +32,14 @@ def _require_lead(user):
 def tokens_for(user):
     refresh = RefreshToken.for_user(user)
     return {"access": str(refresh.access_token), "refresh": str(refresh)}
+
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def site_settings(request):
+    """Public branding read by the frontend (brand name, tagline)."""
+    s = SiteSettings.load()
+    return Response({"brand_name": s.brand_name, "tagline": s.tagline})
 
 
 @api_view(["POST"])
