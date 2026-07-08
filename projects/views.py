@@ -5,6 +5,7 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+from . import notifications
 from .models import Activity, Project, Task
 from .serializers import (
     ActivityCreateSerializer,
@@ -22,7 +23,7 @@ Stage = Project.Stage
 
 
 def log_activity(project, user, text, kind=Activity.Kind.SYSTEM):
-    Activity.objects.create(
+    return Activity.objects.create(
         project=project,
         author=user,
         author_name=user.full_name or user.email,
@@ -75,6 +76,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
             stage=Stage.SUBMITTED,
         )
         log_activity(project, request.user, "Submitted the project brief. Awaiting a quote.")
+        notifications.notify_project_submitted(project)
         return self._detail(project, status.HTTP_201_CREATED)
 
     def _require_lead(self):
@@ -94,6 +96,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
         project.save(update_fields=["quote_usd", "stage"])
         log_activity(project, request.user,
                      f"Sent a quote of ${project.quote_usd:,} — ready for payment.")
+        notifications.notify_quote_sent(project)
         return self._detail(project)
 
     @action(detail=True, methods=["post"])
@@ -121,6 +124,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
             ])
         log_activity(project, request.user,
                      f"Assigned {dev.full_name} and kicked off development.")
+        notifications.notify_developer_assigned(project)
         return self._detail(project)
 
     @action(detail=True, methods=["post"], url_path="submit-review")
@@ -133,6 +137,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
         project.stage = Stage.REVIEW
         project.save(update_fields=["stage"])
         log_activity(project, request.user, "Submitted the work for client review.")
+        notifications.notify_submitted_for_review(project)
         return self._detail(project)
 
     @action(detail=True, methods=["post"])
@@ -145,6 +150,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
         project.stage = Stage.COMPLETED
         project.save(update_fields=["stage"])
         log_activity(project, request.user, "Approved delivery. Project complete!")
+        notifications.notify_project_completed(project)
         return self._detail(project)
 
     @action(detail=True, methods=["post"])
@@ -155,7 +161,8 @@ class ProjectViewSet(viewsets.ModelViewSet):
         text = serializer.validated_data["text"].strip()
         if not text:
             raise ValidationError("Write an update first.")
-        log_activity(project, request.user, text, kind=serializer.validated_data["kind"])
+        entry = log_activity(project, request.user, text, kind=serializer.validated_data["kind"])
+        notifications.notify_update_posted(project, entry)
         return self._detail(project)
 
 

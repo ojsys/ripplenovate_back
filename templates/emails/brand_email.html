@@ -1,0 +1,41 @@
+{% autoescape off %}
+<!doctype html>
+<html>
+<body style="margin:0;background:#FBFAF8;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#FBFAF8;padding:30px 12px">
+  <tr>
+    <td align="center">
+      <table role="presentation" width="560" cellpadding="0" cellspacing="0" style="max-width:560px;width:100%">
+        <tr>
+          <td style="padding:4px 6px 18px">
+            <span style="display:inline-block;width:12px;height:12px;border-radius:50%;background:#0FA37F;vertical-align:middle;margin-right:8px"></span>
+            <span style="font-weight:700;font-size:16px;color:#14181C;vertical-align:middle">{{ brand }}</span>
+          </td>
+        </tr>
+        <tr>
+          <td style="background:#ffffff;border:1px solid #EDEAE3;border-radius:18px;padding:30px 30px 28px">
+            <h1 style="font-weight:700;font-size:21px;color:#14181C;margin:0 0 16px;letter-spacing:-.01em">{{ heading }}</h1>
+            {% for paragraph in paragraphs %}
+              <p style="margin:0 0 14px;font-size:15px;line-height:1.65;color:#3A424C">{{ paragraph }}</p>
+            {% endfor %}
+            {% if cta %}
+              <div style="margin-top:8px">
+                <a href="{{ cta.url }}" style="display:inline-block;background:#0FA37F;color:#ffffff;text-decoration:none;font-weight:600;font-size:15px;padding:13px 24px;border-radius:12px">
+                  {{ cta.label }} →
+                </a>
+              </div>
+            {% endif %}
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:18px 8px;color:#8B93A0;font-size:12.5px">
+            {{ brand }} — Work Globally. Thrive Locally.
+          </td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+</table>
+</body>
+</html>
+{% endautoescape %}

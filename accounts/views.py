@@ -8,7 +8,13 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from .emails import send_password_reset_email, send_verification_email
+from .emails import (
+    send_delivery_lead_welcome,
+    send_developer_welcome,
+    send_password_reset_email,
+    send_verification_email,
+    send_welcome_client,
+)
 from .models import EmailToken, SiteSettings
 from .serializers import (
     ChangePasswordSerializer,
@@ -96,9 +102,13 @@ def verify_email(request):
         return Response({"detail": "This verification link is invalid or has expired."},
                         status=status.HTTP_400_BAD_REQUEST)
     user = token.user
+    already_verified = user.is_email_verified
     user.is_email_verified = True
     user.save(update_fields=["is_email_verified"])
     token.mark_used()
+    # Send the welcome email the first time a client verifies.
+    if not already_verified and user.role == User.Role.CLIENT:
+        send_welcome_client(user)
     return Response({**tokens_for(user), "user": UserSerializer(user).data,
                      "detail": "Email verified. You're all set."})
 
@@ -177,6 +187,7 @@ def developers(request):
         serializer = DeveloperCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = serializer.save()
+        send_developer_welcome(user)
         return Response(UserSerializer(user).data, status=status.HTTP_201_CREATED)
     qs = User.objects.filter(role=User.Role.DEVELOPER).order_by("full_name")
     return Response(UserSerializer(qs, many=True).data)
@@ -208,8 +219,15 @@ def update_role(request, user_id):
         return Response({"detail": "User not found."}, status=status.HTTP_404_NOT_FOUND)
     serializer = RoleUpdateSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
+    previous_role = target.role
     target.role = serializer.validated_data["role"]
     if "specialty" in serializer.validated_data:
         target.specialty = serializer.validated_data["specialty"]
     target.save(update_fields=["role", "specialty"])
+    # Welcome the user into their new role (only on an actual change).
+    if target.role != previous_role:
+        if target.role == User.Role.DELIVERY_LEAD:
+            send_delivery_lead_welcome(target)
+        elif target.role == User.Role.DEVELOPER:
+            send_developer_welcome(target)
     return Response(UserSerializer(target).data)

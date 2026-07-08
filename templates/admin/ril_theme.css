@@ -47,7 +47,7 @@ h1, h2, h3, .rip-brand-txt, .rip-hero-title { font-family: "Space Grotesk", sans
   width: 264px; flex: none; background: var(--card); border-right: 1px solid var(--border);
   display: flex; flex-direction: column; position: sticky; top: 0; height: 100vh; overflow-y: auto;
 }
-.rip-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
+.rip-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; overflow-x: clip; }
 
 /* ---------- Sidebar brand + nav ---------- */
 .rip-brand { display: flex; align-items: center; gap: 11px; padding: 20px 20px 16px; border-bottom: 1px solid var(--border); }
@@ -86,7 +86,8 @@ h1, h2, h3, .rip-brand-txt, .rip-hero-title { font-family: "Space Grotesk", sans
 .rip-avatar { width: 36px; height: 36px; border-radius: 50%; background: var(--ink); color: #fff; display: flex; align-items: center; justify-content: center; font-family: "Space Grotesk",sans-serif; font-weight: 600; font-size: 14px; }
 
 /* ---------- Content ---------- */
-.rip-content { flex: 1; width: 100%; max-width: 1380px; margin: 0 auto; padding: 28px 34px 72px; box-sizing: border-box; }
+/* Left-aligned + fills the space after the sidebar (no centering gap on wide screens) */
+.rip-content { flex: 1; width: 100%; max-width: 1640px; margin: 0; padding: 28px 40px 72px; box-sizing: border-box; }
 .rip-content > #content { width: 100%; padding: 0; margin: 0; }
 #content > h1 { font-family: "Space Grotesk",sans-serif; font-weight: 700; font-size: 26px; letter-spacing: -.02em; margin: 0 0 20px; }
 .messagelist { padding: 0; margin: 0 0 18px; }
@@ -133,7 +134,7 @@ input:focus, textarea:focus, select:focus, .vTextField:focus {
 #changelist-filter li a:hover { background: #FAF9F6; }
 #changelist-filter li.selected a { background: var(--green-soft); color: var(--green-text); font-weight: 600; }
 
-#changelist .results { border: 1px solid var(--border); border-radius: 16px; overflow: hidden; background: #fff; box-shadow: 0 1px 2px rgba(20,24,28,.03); }
+#changelist .results { border: 1px solid var(--border); border-radius: 16px; overflow-x: auto; background: #fff; box-shadow: 0 1px 2px rgba(20,24,28,.03); }
 #result_list { border: none; width: 100%; border-collapse: collapse; }
 #result_list thead th { background: #FAF9F6; padding: 13px 14px; border-bottom: 1px solid var(--border); text-transform: uppercase; font-size: 11px; letter-spacing: .05em; color: var(--muted); }
 #result_list thead th a { color: var(--muted-2); }

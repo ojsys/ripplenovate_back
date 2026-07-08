@@ -101,7 +101,8 @@ def initialize(project, user):
 
 def _mark_paid(payment, raw):
     """Idempotently mark a payment successful and advance the project to Paid."""
-    from projects.views import log_activity  # local import to avoid cycle
+    from projects import notifications  # local import to avoid cycle
+    from projects.views import log_activity
 
     if payment.status == Payment.Status.SUCCESS:
         return payment
@@ -115,6 +116,7 @@ def _mark_paid(payment, raw):
         project.stage = project.Stage.PAID
         project.save(update_fields=["stage"])
         log_activity(project, project.client, "Paid the invoice via Paystack.")
+        notifications.notify_payment_received(project)
     return payment
 
 

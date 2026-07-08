@@ -1,0 +1,11 @@
+{{ heading }}
+
+{% for paragraph in paragraphs %}
+{{ paragraph }}
+
+{% endfor %}
+{% if cta %}
+{{ cta.label }}: {{ cta.url }}
+
+{% endif %}
+— {{ brand }}
