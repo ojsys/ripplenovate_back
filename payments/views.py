@@ -75,6 +75,7 @@ def invoice(request, pk):
         "fee_percent": settings.PAYSTACK_FEE_PERCENT,
         "charge_currency": currency,
         "charge_amount_subunit": amount_subunit,
+        "usd_to_ngn_rate": str(paystack.usd_to_ngn_rate()) if currency == "NGN" else None,
         "is_paid": project.is_paid,
         "public_key": settings.PAYSTACK_PUBLIC_KEY,
         "paid_reference": latest.reference if latest else None,

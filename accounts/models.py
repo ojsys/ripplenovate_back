@@ -1,8 +1,11 @@
 import uuid
 from datetime import timedelta
+from decimal import Decimal
 
+from django.conf import settings
 from django.contrib.auth.models import AbstractUser, BaseUserManager
-from django.db import models
+from django.core.validators import MinValueValidator
+from django.db import DatabaseError, models
 from django.utils import timezone
 
 
@@ -110,6 +113,15 @@ class SiteSettings(models.Model):
 
     brand_name = models.CharField(max_length=100, default="Ripple Innovation Labs")
     tagline = models.CharField(max_length=150, default="Work Globally · Thrive Locally")
+    usd_to_ngn_rate = models.DecimalField(
+        "USD → NGN rate",
+        max_digits=12,
+        decimal_places=2,
+        default=Decimal("1600.00"),
+        validators=[MinValueValidator(Decimal("0.01"))],
+        help_text="Naira per 1 USD. Applied to every invoice charged in NGN from the "
+                  "moment it's saved — update it when the market rate moves.",
+    )
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
@@ -127,3 +139,17 @@ class SiteSettings(models.Model):
     def load(cls):
         obj, _ = cls.objects.get_or_create(pk=1)
         return obj
+
+    @classmethod
+    def usd_to_ngn(cls):
+        """Live USD→NGN rate: the admin-editable value, else the .env fallback.
+
+        Read-only (no row is created) so it's safe on the payment path.
+        """
+        try:
+            rate = cls.objects.values_list("usd_to_ngn_rate", flat=True).first()
+        except DatabaseError:  # table not migrated yet
+            rate = None
+        if rate and rate > 0:
+            return Decimal(rate)
+        return Decimal(str(settings.USD_TO_NGN_RATE))

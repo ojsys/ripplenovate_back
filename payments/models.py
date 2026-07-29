@@ -16,6 +16,10 @@ class Payment(models.Model):
     amount_subunit = models.PositiveBigIntegerField()
     currency = models.CharField(max_length=8, default="NGN")
     usd_total = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    # Rate locked in at initialization; null when the charge currency is USD.
+    usd_to_ngn_rate = models.DecimalField(
+        "USD → NGN rate used", max_digits=12, decimal_places=2, null=True, blank=True
+    )
     status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING)
     paid_at = models.DateTimeField(null=True, blank=True)
     raw = models.JSONField(default=dict, blank=True)

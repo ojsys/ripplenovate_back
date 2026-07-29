@@ -34,7 +34,18 @@ class EmailTokenAdmin(admin.ModelAdmin):
 class SiteSettingsAdmin(admin.ModelAdmin):
     """Singleton: edit the one row; can't add more or delete it."""
 
-    list_display = ("brand_name", "tagline", "updated_at")
+    list_display = ("brand_name", "tagline", "usd_to_ngn_rate", "updated_at")
+    readonly_fields = ("updated_at",)
+    fieldsets = (
+        ("Branding", {"fields": ("brand_name", "tagline")}),
+        ("Payments", {
+            "fields": ("usd_to_ngn_rate",),
+            "description": "Quotes are fixed in USD. This rate converts the invoice "
+                           "total to naira at the moment the client pays, so a saved "
+                           "change applies to every unpaid invoice immediately.",
+        }),
+        (None, {"fields": ("updated_at",)}),
+    )
 
     def has_add_permission(self, request):
         return not SiteSettings.objects.exists()

@@ -11,6 +11,8 @@ import requests
 from django.conf import settings
 from django.utils import timezone
 
+from accounts.models import SiteSettings
+
 from .models import Payment
 
 PAYSTACK_BASE = "https://api.paystack.co"
@@ -42,11 +44,16 @@ def quote_breakdown(project):
     return {"subtotal_usd": subtotal, "fee_usd": fee, "total_usd": total}
 
 
+def usd_to_ngn_rate():
+    """The rate to bill at — admin-editable in Site settings, .env as fallback."""
+    return SiteSettings.usd_to_ngn()
+
+
 def charge_amount(total_usd):
     """Convert a USD total into the charge currency's smallest unit."""
     currency = settings.PAYSTACK_CURRENCY
     if currency == "NGN":
-        naira = _money(Decimal(total_usd) * Decimal(str(settings.USD_TO_NGN_RATE)))
+        naira = _money(Decimal(total_usd) * usd_to_ngn_rate())
         return currency, int((naira * 100).to_integral_value(rounding=ROUND_HALF_UP))
     # USD (or any account-supported currency billed in cents)
     return currency, int((_money(total_usd) * 100).to_integral_value(rounding=ROUND_HALF_UP))
@@ -86,6 +93,7 @@ def initialize(project, user):
         amount_subunit=amount_subunit,
         currency=currency,
         usd_total=breakdown["total_usd"],
+        usd_to_ngn_rate=usd_to_ngn_rate() if currency == "NGN" else None,
         status=Payment.Status.PENDING,
     )
     return {
