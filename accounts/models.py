@@ -4,7 +4,8 @@ from decimal import Decimal
 
 from django.conf import settings
 from django.contrib.auth.models import AbstractUser, BaseUserManager
-from django.core.validators import MinValueValidator
+from django.core.exceptions import ValidationError
+from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import DatabaseError, models
 from django.utils import timezone
 
@@ -60,6 +61,12 @@ class User(AbstractUser):
     specialty = models.CharField(max_length=150, blank=True)
     active_load = models.PositiveIntegerField(default=0)
 
+    # Payout account for earners (developers and delivery leads). Snapshotted onto
+    # every Withdrawal so a later edit never rewrites past payout history.
+    bank_name = models.CharField(max_length=120, blank=True)
+    bank_account_number = models.CharField(max_length=34, blank=True)
+    bank_account_name = models.CharField(max_length=150, blank=True)
+
     is_email_verified = models.BooleanField(default=False)
 
     USERNAME_FIELD = "email"
@@ -83,6 +90,15 @@ class User(AbstractUser):
         if self.role == self.Role.DELIVERY_LEAD:
             return "Delivery Lead"
         return self.get_role_display()
+
+    @property
+    def can_earn(self):
+        """Developers and delivery leads are paid out of delivered project value."""
+        return self.role in (self.Role.DEVELOPER, self.Role.DELIVERY_LEAD)
+
+    @property
+    def has_payout_account(self):
+        return bool(self.bank_name and self.bank_account_number and self.bank_account_name)
 
 
 class EmailToken(models.Model):
@@ -111,6 +127,12 @@ class EmailToken(models.Model):
 class SiteSettings(models.Model):
     """Editable site-wide branding — a single row managed in the Django admin."""
 
+    # Fallbacks used before the row exists (and by the payout math if the table
+    # hasn't been migrated yet).
+    DEFAULT_DEVELOPER_SHARE = Decimal("60.00")
+    DEFAULT_LEAD_SHARE = Decimal("15.00")
+    DEFAULT_MIN_WITHDRAWAL = Decimal("50.00")
+
     brand_name = models.CharField(max_length=100, default="Ripple Innovation Labs")
     tagline = models.CharField(max_length=150, default="Work Globally · Thrive Locally")
     usd_to_ngn_rate = models.DecimalField(
@@ -122,6 +144,32 @@ class SiteSettings(models.Model):
         help_text="Naira per 1 USD. Applied to every invoice charged in NGN from the "
                   "moment it's saved — update it when the market rate moves.",
     )
+    developer_share_percent = models.DecimalField(
+        "Developer share of a quote (%)",
+        max_digits=5,
+        decimal_places=2,
+        default=DEFAULT_DEVELOPER_SHARE,
+        validators=[MinValueValidator(Decimal("0")), MaxValueValidator(Decimal("100"))],
+        help_text="What the assigned developer earns from a project's quote once the "
+                  "client approves delivery. Applies to projects completed from now on.",
+    )
+    delivery_lead_share_percent = models.DecimalField(
+        "Delivery lead share of a quote (%)",
+        max_digits=5,
+        decimal_places=2,
+        default=DEFAULT_LEAD_SHARE,
+        validators=[MinValueValidator(Decimal("0")), MaxValueValidator(Decimal("100"))],
+        help_text="What the delivery lead who quoted the project earns on approval. "
+                  "The remainder of the quote stays with the platform.",
+    )
+    min_withdrawal_usd = models.DecimalField(
+        "Minimum withdrawal (USD)",
+        max_digits=10,
+        decimal_places=2,
+        default=DEFAULT_MIN_WITHDRAWAL,
+        validators=[MinValueValidator(Decimal("0"))],
+        help_text="The smallest balance a developer or delivery lead can withdraw.",
+    )
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
@@ -130,6 +178,14 @@ class SiteSettings(models.Model):
 
     def __str__(self):
         return self.brand_name
+
+    def clean(self):
+        shares = self.developer_share_percent + self.delivery_lead_share_percent
+        if shares > Decimal("100"):
+            raise ValidationError(
+                "The developer and delivery lead shares can't add up to more than "
+                f"100% of a quote (currently {shares}%)."
+            )
 
     def save(self, *args, **kwargs):
         self.pk = 1  # enforce a single row (singleton)
@@ -153,3 +209,29 @@ class SiteSettings(models.Model):
         if rate and rate > 0:
             return Decimal(rate)
         return Decimal(str(settings.USD_TO_NGN_RATE))
+
+    @classmethod
+    def payout_config(cls):
+        """Payout percentages + withdrawal floor, with defaults if no row exists.
+
+        Read-only (no row is created) so it's safe on the earnings path.
+        """
+        fields = ("developer_share_percent", "delivery_lead_share_percent",
+                  "min_withdrawal_usd")
+        try:
+            row = cls.objects.values(*fields).first()
+        except DatabaseError:  # table not migrated yet
+            row = None
+        row = row or {}
+        # A configured 0% is meaningful, so only fall back on a missing value.
+        def pick(key, default):
+            value = row.get(key)
+            return Decimal(value) if value is not None else default
+
+        return {
+            "developer_share_percent": pick("developer_share_percent",
+                                            cls.DEFAULT_DEVELOPER_SHARE),
+            "delivery_lead_share_percent": pick("delivery_lead_share_percent",
+                                                cls.DEFAULT_LEAD_SHARE),
+            "min_withdrawal_usd": pick("min_withdrawal_usd", cls.DEFAULT_MIN_WITHDRAWAL),
+        }

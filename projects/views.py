@@ -1,5 +1,7 @@
+import logging
+
 from django.contrib.auth import get_user_model
-from rest_framework import status, viewsets
+from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.permissions import IsAuthenticated
@@ -12,6 +14,7 @@ from .serializers import (
     AssignSerializer,
     ProjectCreateSerializer,
     ProjectDetailSerializer,
+    ProjectEditSerializer,
     ProjectListSerializer,
     QuoteSerializer,
     TaskSerializer,
@@ -20,6 +23,62 @@ from .serializers import (
 User = get_user_model()
 Role = User.Role
 Stage = Project.Stage
+logger = logging.getLogger("ripple")
+
+
+# Short, human names for the fields a lead can edit, used to describe an edit in
+# the activity feed.
+EDIT_FIELD_LABELS = {
+    "title": "title",
+    "category": "service",
+    "timeline": "timeline",
+    "budget_range": "budget range",
+    "target_date": "target date",
+}
+
+
+def describe_edit(project, changes):
+    """Turn a {field: (old, new)} diff into one readable activity sentence."""
+    parts = []
+    # Money first — it's the change people care about most.
+    if "quote_usd" in changes:
+        old, new = changes["quote_usd"]
+        parts.append(f"re-priced it from ${old:,} to ${new:,}")
+    for field, label in EDIT_FIELD_LABELS.items():
+        if field in changes:
+            old, new = changes[field]
+            parts.append(f"changed the {label} from “{old or '—'}” to “{new or '—'}”")
+    if "description" in changes:
+        parts.append("revised the brief")
+
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        detail = parts[0]
+    else:
+        detail = ", ".join(parts[:-1]) + f", and {parts[-1]}"
+    return f"Edited the project — {detail}."
+
+
+def credit_earnings(project):
+    """Credit the developer / lead shares once the client approves delivery.
+
+    Never breaks the approval: the earnings read path backfills any project that
+    slipped through, so a failure here is self-healing.
+    """
+    # Local imports keep the app dependency one-way (payments → projects).
+    from payments import earnings as earnings_service
+    from payments import notifications as payout_notifications
+
+    try:
+        credited = earnings_service.record_project_earnings(project)
+    except Exception as exc:  # noqa: BLE001 - approval must not fail on payout math
+        logger.error("crediting earnings for %s failed: %s", project.code, exc)
+        return
+    for earning in credited:
+        payout_notifications.notify_earning_credited(
+            earning.user, project, earning.amount_usd
+        )
 
 
 def log_activity(project, user, text, kind=Activity.Kind.SYSTEM):
@@ -33,7 +92,23 @@ def log_activity(project, user, text, kind=Activity.Kind.SYSTEM):
     )
 
 
-class ProjectViewSet(viewsets.ModelViewSet):
+class ProjectViewSet(mixins.ListModelMixin,
+                     mixins.RetrieveModelMixin,
+                     mixins.CreateModelMixin,
+                     viewsets.GenericViewSet):
+    """Projects are listed, read, and created here; every state change after that
+    goes through one of the lifecycle actions below.
+
+    Deliberately **not** a ModelViewSet. A blanket PUT/PATCH would expose every
+    field of ProjectDetailSerializer — `stage`, `quote_usd`, `developer` — to
+    anyone the queryset lets through, so a client could mark their own brief
+    Completed (or re-price it) without a quote, a payment, or an approval. Those
+    writes bypass log_activity(), so nothing lands in the activity feed, no
+    notification goes out, and no earnings are credited: the project changes and
+    the change is never recorded. DELETE was likewise open, cascading away the
+    project's tasks, activity, payments, and earnings.
+    """
+
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
@@ -93,10 +168,56 @@ class ProjectViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         project.quote_usd = serializer.validated_data["quote_usd"]
         project.stage = Stage.QUOTED
-        project.save(update_fields=["quote_usd", "stage"])
+        # The lead who quotes owns the brief, and earns the lead share on delivery.
+        project.lead = request.user
+        project.save(update_fields=["quote_usd", "stage", "lead"])
         log_activity(project, request.user,
                      f"Sent a quote of ${project.quote_usd:,} — ready for payment.")
         notifications.notify_quote_sent(project)
+        return self._detail(project)
+
+    @action(detail=True, methods=["patch"])
+    def edit(self, request, pk=None):
+        """Delivery lead fixes a brief or re-prices a quote — and it's recorded.
+
+        The quote is frozen once the client has paid: the invoice they settled and
+        the earnings credited on approval are both derived from it, so a later
+        change would quietly disagree with money that has already moved.
+        """
+        project = self.get_object()
+        self._require_lead()
+        serializer = ProjectEditSerializer(project, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        updates = serializer.validated_data
+
+        if "quote_usd" in updates and project.is_paid:
+            raise ValidationError(
+                "This project is already paid — the quote is locked. "
+                "Everything else on the brief can still be edited."
+            )
+        if "quote_usd" in updates and project.stage == Stage.SUBMITTED:
+            raise ValidationError(
+                "This brief hasn't been quoted yet — use Send quote instead."
+            )
+
+        # Diff before saving so the activity entry can name what actually changed.
+        changes = {
+            field: (getattr(project, field), value)
+            for field, value in updates.items()
+            if getattr(project, field) != value
+        }
+        if not changes:
+            return self._detail(project)
+
+        for field, (_old, new) in changes.items():
+            setattr(project, field, new)
+        project.save(update_fields=list(changes))
+
+        summary = describe_edit(project, changes)
+        log_activity(project, request.user, summary)
+        notifications.notify_project_edited(
+            project, summary, repriced="quote_usd" in changes
+        )
         return self._detail(project)
 
     @action(detail=True, methods=["post"])
@@ -115,7 +236,10 @@ class ProjectViewSet(viewsets.ModelViewSet):
         titles = [t.strip() for t in serializer.validated_data.get("tasks", []) if t.strip()]
         project.developer = dev
         project.stage = Stage.IN_PROGRESS
-        project.save(update_fields=["developer", "stage"])
+        # Covers briefs that were paid before leads were tracked on the project.
+        if not project.lead_id:
+            project.lead = request.user
+        project.save(update_fields=["developer", "stage", "lead"])
         if titles:
             project.tasks.all().delete()
             Task.objects.bulk_create([
@@ -151,6 +275,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
         project.save(update_fields=["stage"])
         log_activity(project, request.user, "Approved delivery. Project complete!")
         notifications.notify_project_completed(project)
+        credit_earnings(project)
         return self._detail(project)
 
     @action(detail=True, methods=["post"])

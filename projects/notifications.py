@@ -100,6 +100,27 @@ def notify_payment_received(project):
 
 
 @_safe
+def notify_project_edited(project, summary, repriced=False):
+    """Tell the client (and the assigned developer) that the lead changed something."""
+    recipients = {project.client.email}
+    if project.developer:
+        recipients.add(project.developer.email)
+    paragraphs = [f"The delivery team updated “{project.title}”:", summary]
+    if repriced:
+        paragraphs.append(
+            f"The quote is now {_money(project.quote_usd)}. Review the updated invoice "
+            "before paying."
+        )
+    send_brand_email(
+        subject=f"{project.title} was updated",
+        to=recipients,
+        heading="A project detail changed",
+        paragraphs=paragraphs,
+        cta=("View the project", _project_url(project)),
+    )
+
+
+@_safe
 def notify_developer_assigned(project):
     if project.developer:
         send_brand_email(

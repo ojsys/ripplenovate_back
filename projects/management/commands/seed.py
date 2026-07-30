@@ -164,6 +164,8 @@ class Command(BaseCommand):
                 stage=spec["stage"], quote_usd=spec["quote_usd"],
                 developer=spec["developer"], target_date=spec["target_date"],
                 description=spec["description"],
+                # Quoted briefs and beyond are owned by the lead who quoted them.
+                lead=lead if spec["stage"] != Stage.SUBMITTED else None,
             )
             for i, (title, done) in enumerate(spec["tasks"]):
                 Task.objects.create(project=project, title=title, done=done,

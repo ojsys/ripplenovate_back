@@ -13,6 +13,11 @@ class UserAdmin(BaseUserAdmin):
     fieldsets = (
         (None, {"fields": ("email", "password")}),
         ("Profile", {"fields": ("full_name", "role", "company", "specialty", "active_load")}),
+        ("Payout account", {
+            "fields": ("bank_name", "bank_account_number", "bank_account_name"),
+            "description": "Where withdrawals are paid. Developers and delivery leads "
+                           "maintain this themselves when they withdraw earnings.",
+        }),
         ("Status", {"fields": ("is_email_verified", "is_active", "is_staff", "is_superuser")}),
         ("Groups", {"fields": ("groups", "user_permissions")}),
     )
@@ -34,7 +39,8 @@ class EmailTokenAdmin(admin.ModelAdmin):
 class SiteSettingsAdmin(admin.ModelAdmin):
     """Singleton: edit the one row; can't add more or delete it."""
 
-    list_display = ("brand_name", "tagline", "usd_to_ngn_rate", "updated_at")
+    list_display = ("brand_name", "tagline", "usd_to_ngn_rate",
+                    "developer_share_percent", "delivery_lead_share_percent", "updated_at")
     readonly_fields = ("updated_at",)
     fieldsets = (
         ("Branding", {"fields": ("brand_name", "tagline")}),
@@ -43,6 +49,13 @@ class SiteSettingsAdmin(admin.ModelAdmin):
             "description": "Quotes are fixed in USD. This rate converts the invoice "
                            "total to naira at the moment the client pays, so a saved "
                            "change applies to every unpaid invoice immediately.",
+        }),
+        ("Earnings & payouts", {
+            "fields": ("developer_share_percent", "delivery_lead_share_percent",
+                       "min_withdrawal_usd"),
+            "description": "How a project's quote is split when the client approves "
+                           "delivery. Already-credited earnings keep the share they "
+                           "were created with — changes apply to future approvals.",
         }),
         (None, {"fields": ("updated_at",)}),
     )

@@ -18,10 +18,10 @@ class ActivityInline(admin.TabularInline):
 
 @admin.register(Project)
 class ProjectAdmin(admin.ModelAdmin):
-    list_display = ("code", "title", "company", "category", "stage", "quote_usd", "developer", "created_at")
+    list_display = ("code", "title", "company", "category", "stage", "quote_usd", "developer", "lead", "created_at")
     list_filter = ("stage", "category")
     search_fields = ("code", "title", "company", "client__full_name", "client__email")
-    autocomplete_fields = ("client", "developer")
+    autocomplete_fields = ("client", "developer", "lead")
     readonly_fields = ("code", "created_at")
     date_hierarchy = "created_at"
     inlines = [TaskInline, ActivityInline]

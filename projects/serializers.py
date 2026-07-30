@@ -46,6 +46,12 @@ class ProjectListSerializer(serializers.ModelSerializer):
             "quote_usd", "developer", "developer_name", "progress_pct", "is_paid",
             "target_date", "created_at",
         ]
+        # Output only. Lifecycle fields are moved by the viewset's actions (which
+        # log activity and notify), never written straight from a request body.
+        read_only_fields = [
+            "code", "title", "company", "category", "stage", "quote_usd",
+            "developer", "target_date", "created_at",
+        ]
 
     def get_developer_name(self, obj):
         return obj.developer.full_name if obj.developer else ""
@@ -61,6 +67,9 @@ class ProjectDetailSerializer(ProjectListSerializer):
         fields = ProjectListSerializer.Meta.fields + [
             "client_name", "description", "timeline", "budget_range",
             "developer_role", "tasks", "activity",
+        ]
+        read_only_fields = ProjectListSerializer.Meta.read_only_fields + [
+            "description", "timeline", "budget_range",
         ]
 
     def get_client_name(self, obj):
@@ -84,6 +93,41 @@ class ProjectCreateSerializer(serializers.ModelSerializer):
         if not v.strip():
             raise serializers.ValidationError("Describe what we're building.")
         return v.strip()
+
+
+class ProjectEditSerializer(serializers.ModelSerializer):
+    """A delivery lead correcting a brief, or re-pricing a quote.
+
+    Only the fields a lead legitimately maintains. `stage`, `developer` and
+    `client` are absent on purpose — those move through the lifecycle actions,
+    which log activity and notify the people involved.
+    """
+
+    class Meta:
+        model = Project
+        fields = ["title", "category", "timeline", "budget_range", "description",
+                  "target_date", "quote_usd"]
+        extra_kwargs = {field: {"required": False} for field in fields}
+
+    def validate_title(self, v):
+        if not v.strip():
+            raise serializers.ValidationError("The project needs a title.")
+        return v.strip()
+
+    def validate_description(self, v):
+        if not v.strip():
+            raise serializers.ValidationError("The brief can't be empty.")
+        return v.strip()
+
+    def validate_quote_usd(self, v):
+        if v < 1:
+            raise serializers.ValidationError("A quote has to be at least $1.")
+        return v
+
+    def validate(self, attrs):
+        if not attrs:
+            raise serializers.ValidationError("Nothing to change.")
+        return attrs
 
 
 class QuoteSerializer(serializers.Serializer):

@@ -47,6 +47,11 @@ class Project(models.Model):
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
         null=True, blank=True, related_name="assigned_projects",
     )
+    # The delivery lead who quoted the brief — earns the lead share on completion.
+    lead = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="led_projects",
+    )
     target_date = models.CharField(max_length=40, blank=True, default="TBD")
     created_at = models.DateTimeField(auto_now_add=True)
 
