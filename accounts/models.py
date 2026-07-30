@@ -179,6 +179,17 @@ class SiteSettings(models.Model):
     def __str__(self):
         return self.brand_name
 
+    @property
+    def platform_share_percent(self):
+        """What's left of a quote after the developer and delivery lead take theirs.
+
+        Derived rather than stored so the three shares can never fail to add up.
+        """
+        remainder = (Decimal("100")
+                     - (self.developer_share_percent or Decimal("0"))
+                     - (self.delivery_lead_share_percent or Decimal("0")))
+        return max(remainder, Decimal("0"))
+
     def clean(self):
         shares = self.developer_share_percent + self.delivery_lead_share_percent
         if shares > Decimal("100"):

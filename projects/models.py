@@ -1,7 +1,14 @@
 import random
+from decimal import ROUND_HALF_UP, Decimal
 
 from django.conf import settings
+from django.core.exceptions import ValidationError
+from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
+
+
+def _money(value):
+    return Decimal(value or 0).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
 def generate_code():
@@ -52,6 +59,21 @@ class Project(models.Model):
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
         null=True, blank=True, related_name="led_projects",
     )
+    # Per-project payout overrides. Null means "use the site default", so the
+    # usual case stays in one place and only exceptional projects carry a number.
+    SHARE_VALIDATORS = [MinValueValidator(Decimal("0")), MaxValueValidator(Decimal("100"))]
+    developer_share_percent = models.DecimalField(
+        "Developer share (%)", max_digits=5, decimal_places=2,
+        null=True, blank=True, validators=SHARE_VALIDATORS,
+        help_text="Leave blank to use the site default. Set a value to pay this "
+                  "project differently — useful for a large or unusual build.",
+    )
+    delivery_lead_share_percent = models.DecimalField(
+        "Delivery lead share (%)", max_digits=5, decimal_places=2,
+        null=True, blank=True, validators=SHARE_VALIDATORS,
+        help_text="Leave blank to use the site default. The platform keeps "
+                  "whatever the developer and lead shares don't claim.",
+    )
     target_date = models.CharField(max_length=40, blank=True, default="TBD")
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -71,6 +93,70 @@ class Project(models.Model):
     @property
     def is_paid(self):
         return self.stage in self.PAID_STAGES
+
+    def clean(self):
+        dev = self.developer_share_percent
+        lead = self.delivery_lead_share_percent
+        if dev is not None and lead is not None and dev + lead > Decimal("100"):
+            raise ValidationError(
+                "The developer and delivery lead shares can't add up to more than "
+                f"100% of the quote (currently {dev + lead}%)."
+            )
+
+    def payout_split(self):
+        """How this project's quote divides — developer, delivery lead, platform.
+
+        A per-project override wins; anything left blank falls back to the site
+        default. The platform's cut is the remainder, never a stored percentage,
+        so the three shares always total the quote exactly.
+
+        Once a project is approved the developer/lead figures come from the
+        credited Earning rows instead — those are snapshots of what was actually
+        paid, so changing an override later can't retroactively rewrite history
+        (or leave the platform's cut disagreeing with the ledger).
+        """
+        from accounts.models import SiteSettings  # local: keeps app imports one-way
+
+        cfg = SiteSettings.payout_config()
+        dev_pct = (self.developer_share_percent
+                   if self.developer_share_percent is not None
+                   else Decimal(cfg["developer_share_percent"]))
+        lead_pct = (self.delivery_lead_share_percent
+                    if self.delivery_lead_share_percent is not None
+                    else Decimal(cfg["delivery_lead_share_percent"]))
+        quote = _money(self.quote_usd)
+
+        credited = {}
+        if self.stage == self.Stage.COMPLETED:
+            for earning in self.earnings.all():
+                amount, pct = credited.get(earning.kind, (Decimal("0"), earning.share_percent))
+                credited[earning.kind] = (amount + earning.amount_usd, pct)
+
+        def part(kind, pct):
+            """What was credited if it has been, else what's projected."""
+            if kind in credited:
+                amount, credited_pct = credited[kind]
+                # Report the snapshot, so a later override can't restate history.
+                return _money(amount), credited_pct
+            return _money(quote * pct / Decimal(100)), pct
+
+        dev_usd, dev_pct = part("developer", dev_pct)
+        lead_usd, lead_pct = part("delivery_lead", lead_pct)
+        platform_usd = _money(quote - dev_usd - lead_usd)
+        return {
+            "quote_usd": quote,
+            "developer_percent": dev_pct,
+            "developer_usd": dev_usd,
+            "delivery_lead_percent": lead_pct,
+            "delivery_lead_usd": lead_usd,
+            # Both derived from the other two, so the split always closes exactly
+            # — including any rounding.
+            "platform_percent": _money(Decimal("100") - dev_pct - lead_pct),
+            "platform_usd": platform_usd,
+            "uses_override": (self.developer_share_percent is not None
+                              or self.delivery_lead_share_percent is not None),
+            "is_settled": bool(credited),
+        }
 
     @property
     def progress_pct(self):

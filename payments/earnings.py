@@ -36,10 +36,19 @@ def config():
 
 
 def share_percent(kind, cfg=None):
+    """The site-wide default share for a role (before per-project overrides)."""
     cfg = cfg or config()
     if kind == Earning.Kind.DEVELOPER:
         return Decimal(cfg["developer_share_percent"])
     return Decimal(cfg["delivery_lead_share_percent"])
+
+
+def project_share(project, kind):
+    """(percent, amount) this project pays a role — honouring its overrides."""
+    split = project.payout_split()
+    if kind == Earning.Kind.DEVELOPER:
+        return split["developer_percent"], split["developer_usd"]
+    return split["delivery_lead_percent"], split["delivery_lead_usd"]
 
 
 def share_amount(quote_usd, percent):
@@ -66,11 +75,9 @@ def record_project_earnings(project):
     if project.stage != Project.Stage.COMPLETED or not project.quote_usd:
         return []
 
-    cfg = config()
     created = []
     for user_id, kind in _earners(project):
-        percent = share_percent(kind, cfg)
-        amount = share_amount(project.quote_usd, percent)
+        percent, amount = project_share(project, kind)
         if amount <= ZERO:
             continue
         earning, was_created = Earning.objects.get_or_create(
@@ -95,19 +102,17 @@ def backfill(user):
 
 def _projected(user):
     """Not-yet-earned value from the user's paid-but-unapproved projects."""
-    cfg = config()
     active = Project.objects.filter(
         Q(developer=user) | Q(lead=user), stage__in=PENDING_STAGES
     ).distinct()
     total = ZERO
     for project in active:
+        split = project.payout_split()
         # A lead can also be the assigned developer; both shares count.
         if project.developer_id == user.id:
-            total += share_amount(project.quote_usd,
-                                  share_percent(Earning.Kind.DEVELOPER, cfg))
+            total += split["developer_usd"]
         if project.lead_id == user.id:
-            total += share_amount(project.quote_usd,
-                                  share_percent(Earning.Kind.DELIVERY_LEAD, cfg))
+            total += split["delivery_lead_usd"]
     return _money(total)
 
 

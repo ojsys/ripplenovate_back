@@ -116,16 +116,55 @@ input:focus, textarea:focus, select:focus, .vTextField:focus {
   border-color: var(--green) !important; outline: none !important; box-shadow: 0 0 0 3px rgba(15,163,127,.15);
 }
 
-/* ---------- Changelist ---------- */
-#content > h1 { }
-#toolbar { background: transparent; border: none; padding: 0 0 16px; }
-#changelist-search label { display: none; }
-#changelist-search #searchbar { border: 1px solid var(--input); border-radius: 999px; padding: 10px 18px; min-width: 260px; background: var(--input-bg); }
-#changelist-search input[type=submit] { border-radius: 999px !important; padding: 10px 20px; margin-left: 8px; background: var(--green) !important; color: #fff !important; }
+/* ---------- Changelist ----------
+   Django puts the search bar, the date drill-down, the results table AND the
+   filter sidebar inside one flex row (.changelist-form-container), so the filter
+   eats into the table's width and wide tables end up squeezed behind it.
+   Re-lay the whole thing as a grid:
 
-#changelist { display: flex !important; align-items: flex-start; gap: 22px; }
-#changelist .changelist-form-container { flex: 1 1 auto; min-width: 0; width: auto; }
-#changelist-filter { flex: 0 0 250px; width: 250px !important; margin: 0 !important; float: none !important; position: static !important; order: 2; background: #fff; border: 1px solid var(--border); border-radius: 16px; padding: 0 0 10px; }
+       ┌─────────────────────────────────────┐
+       │ search                              │  full width
+       ├─────────────────────────────────────┤
+       │ date drill-down                     │  full width
+       ├──────────────────────────┬──────────┤
+       │ results table (scrolls)  │  filter  │  side by side, never overlapping
+       └──────────────────────────┴──────────┘
+
+   The table's own wrapper scrolls horizontally, so extra columns stay reachable
+   without ever pushing the page sideways or hiding under the filter. */
+#changelist { display: block !important; }
+#changelist .changelist-form-container {
+  display: grid !important;
+  grid-template-columns: minmax(0, 1fr);
+  column-gap: 22px; row-gap: 0;
+  align-items: start; width: 100%; float: none; min-width: 0;
+}
+/* Django flags a changelist that actually has filters — only then reserve a
+   second column, so unfiltered tables get the full width. */
+#changelist.filtered .changelist-form-container { grid-template-columns: minmax(0, 1fr) 250px; }
+/* Dissolve Django's anonymous wrapper so its children become grid items. */
+#changelist .changelist-form-container > div:not(#changelist-filter) { display: contents; }
+
+#changelist #toolbar { grid-column: 1 / -1; grid-row: 1; background: transparent; border: none; padding: 0 0 16px; }
+#changelist .toplinks, #changelist .xfull { grid-column: 1 / -1; grid-row: 2; }
+#changelist #changelist-form { grid-column: 1; grid-row: 3; min-width: 0; }
+#changelist-search label { display: none; }
+/* Django wraps the field + button in an unnamed div, so both levels need to flex
+   or the row collapses to its content width. */
+#changelist-search, #changelist-search > div { display: flex; align-items: center; gap: 8px; }
+#changelist-search > div { flex: 1 1 auto; min-width: 0; }
+/* A real flex-basis, plus width:auto to beat the `width: 0` that Django's
+   responsive.css sets on narrow screens — otherwise the input shrinks to a stub. */
+#changelist-search #searchbar { flex: 1 1 260px; width: auto !important; min-width: 0; max-width: 520px; border: 1px solid var(--input); border-radius: 999px; padding: 10px 18px; background: var(--input-bg); }
+#changelist-search input[type=submit] { border-radius: 999px !important; padding: 10px 20px; margin-left: 0; background: var(--green) !important; color: #fff !important; }
+#changelist-search .quiet, #changelist-search #changelist-search-help { flex: none; }
+
+#changelist-filter {
+  grid-column: 2; grid-row: 3; align-self: start;
+  width: auto !important; margin: 0 !important; float: none !important;
+  position: sticky; top: 84px; max-height: calc(100vh - 116px); overflow-y: auto;
+  background: #fff; border: 1px solid var(--border); border-radius: 16px; padding: 0 0 10px;
+}
 #changelist-filter h2 { background: transparent; color: var(--muted); border: none; border-bottom: 1px solid var(--border); border-radius: 0; padding: 15px 18px; margin: 0; font-size: 12px; letter-spacing: .06em; }
 #changelist-filter h3 { color: var(--muted-2); padding: 12px 18px 4px; margin: 0; font-size: 12px; }
 #changelist-filter ul { margin: 0; padding: 2px 10px 6px; border: none; }
@@ -134,10 +173,14 @@ input:focus, textarea:focus, select:focus, .vTextField:focus {
 #changelist-filter li a:hover { background: #FAF9F6; }
 #changelist-filter li.selected a { background: var(--green-soft); color: var(--green-text); font-weight: 600; }
 
-#changelist .results { border: 1px solid var(--border); border-radius: 16px; overflow-x: auto; background: #fff; box-shadow: 0 1px 2px rgba(20,24,28,.03); }
-#result_list { border: none; width: 100%; border-collapse: collapse; }
+/* The table scrolls inside its own card — the page itself never scrolls sideways. */
+#changelist .results { border: 1px solid var(--border); border-radius: 16px; overflow-x: auto; max-width: 100%; background: #fff; box-shadow: 0 1px 2px rgba(20,24,28,.03); }
+#result_list { border: none; width: 100%; min-width: 100%; border-collapse: collapse; }
 #result_list thead th { background: #FAF9F6; padding: 13px 14px; border-bottom: 1px solid var(--border); text-transform: uppercase; font-size: 11px; letter-spacing: .05em; color: var(--muted); }
 #result_list thead th a { color: var(--muted-2); }
+/* One line per cell: a column that used to wrap to three lines in a squeezed
+   table now reads at a glance, and anything past the edge is a scroll away. */
+#result_list thead th, #result_list tbody td, #result_list tbody th { white-space: nowrap; }
 #result_list tbody td, #result_list tbody th { padding: 13px 14px; border-bottom: 1px solid var(--border-2); vertical-align: middle; }
 #result_list tbody tr:last-child td, #result_list tbody tr:last-child th { border-bottom: none; }
 #result_list tbody tr:hover td, #result_list tbody tr:hover th { background: #FAF9F6; }
@@ -151,6 +194,13 @@ input:focus, textarea:focus, select:focus, .vTextField:focus {
 
 /* ---------- Change / add form ---------- */
 form .module, fieldset.module { background: #fff; border: 1px solid var(--border); border-radius: 16px; margin-bottom: 20px; padding: 0; overflow: hidden; box-shadow: 0 1px 2px rgba(20,24,28,.03); }
+/* Inline tables (tasks, activity) get the same treatment as a changelist: wide
+   ones scroll inside their own card instead of being clipped by the card border. */
+.inline-group { max-width: 100%; }
+.inline-group .tabular fieldset.module, .inline-group div.tabular { overflow-x: auto; }
+.inline-group table { width: 100%; min-width: 100%; }
+.inline-group .tabular td, .inline-group .tabular th { white-space: nowrap; }
+.inline-group .tabular td.original p { white-space: nowrap; }
 fieldset.module > h2, .module > h2, .module caption { background: transparent; color: var(--muted); border-bottom: 1px solid var(--border); border-radius: 0; padding: 15px 20px; letter-spacing: .05em; text-transform: uppercase; font-size: 12px; font-weight: 700; }
 .form-row { padding: 16px 20px; border-bottom: 1px solid var(--border-2); }
 fieldset .form-row:last-of-type { border-bottom: none; }
@@ -220,11 +270,20 @@ body.login #content-main { width: 100%; }
   .rip-tiles { grid-template-columns: repeat(3, 1fr); }
   .rip-grid { grid-template-columns: 1fr; }
 }
+/* Not enough room for a table and a sidebar side by side — drop the filter below
+   the results rather than letting it squeeze them. */
+@media (max-width: 1180px) {
+  #changelist.filtered .changelist-form-container { grid-template-columns: minmax(0, 1fr); }
+  #changelist-filter {
+    grid-column: 1; grid-row: 4; position: static; max-height: none;
+    width: 100% !important; margin-top: 18px !important;
+  }
+}
 @media (max-width: 760px) {
   .rip-content { padding: 18px 16px 60px; }
   .rip-topbar { padding: 0 16px; }
   .rip-hero { flex-direction: column; align-items: flex-start; padding: 22px; }
   .rip-tiles { grid-template-columns: 1fr 1fr; }
-  #changelist { flex-direction: column; }
-  #changelist-filter { width: 100% !important; flex-basis: auto; }
+  #changelist-search, #changelist-search > div { flex-wrap: wrap; }
+  #changelist-search #searchbar { flex: 1 1 180px; max-width: none; }
 }
