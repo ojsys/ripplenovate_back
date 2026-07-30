@@ -141,7 +141,7 @@ input:focus, textarea:focus, select:focus, .vTextField:focus {
 }
 /* Django flags a changelist that actually has filters — only then reserve a
    second column, so unfiltered tables get the full width. */
-#changelist.filtered .changelist-form-container { grid-template-columns: minmax(0, 1fr) 250px; }
+#changelist.filtered .changelist-form-container { grid-template-columns: minmax(0, 1fr) 220px; }
 /* Dissolve Django's anonymous wrapper so its children become grid items. */
 #changelist .changelist-form-container > div:not(#changelist-filter) { display: contents; }
 
@@ -270,9 +270,9 @@ body.login #content-main { width: 100%; }
   .rip-tiles { grid-template-columns: repeat(3, 1fr); }
   .rip-grid { grid-template-columns: 1fr; }
 }
-/* Not enough room for a table and a sidebar side by side — drop the filter below
-   the results rather than letting it squeeze them. */
-@media (max-width: 1180px) {
+/* Only stack the filter under the table when the screen is genuinely too narrow
+   for both — a normal laptop keeps the sidebar on the right. */
+@media (max-width: 900px) {
   #changelist.filtered .changelist-form-container { grid-template-columns: minmax(0, 1fr); }
   #changelist-filter {
     grid-column: 1; grid-row: 4; position: static; max-height: none;
