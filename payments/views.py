@@ -113,6 +113,8 @@ def earnings(request):
         **{key: str(value) for key, value in summary.items()},
         "payout_currency": currency,
         "usd_to_ngn_rate": str(paystack.usd_to_ngn_rate()) if currency == "NGN" else None,
+        # The headline quotes the site default; this says whether it's the whole story.
+        "has_custom_splits": earnings_service.has_custom_splits(user),
         "payout_account": {
             "bank_name": user.bank_name,
             "bank_account_number": user.bank_account_number,

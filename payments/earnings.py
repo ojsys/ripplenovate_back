@@ -120,6 +120,20 @@ def _sum(queryset, field="amount_usd"):
     return _money(queryset.aggregate(total=Sum(field))["total"] or 0)
 
 
+def has_custom_splits(user):
+    """True when any of this user's projects is paid on its own percentages.
+
+    The earnings screen quotes the site default; if some of a user's work pays
+    differently, saying a flat "you earn X%" would be wrong.
+    """
+    return Project.objects.filter(
+        Q(developer=user) | Q(lead=user)
+    ).filter(
+        Q(developer_share_percent__isnull=False)
+        | Q(delivery_lead_share_percent__isnull=False)
+    ).exists()
+
+
 def summary(user, refresh=True):
     """Everything the earnings screen needs about one user's money."""
     if refresh:

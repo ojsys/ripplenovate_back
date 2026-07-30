@@ -251,30 +251,68 @@ class ProjectViewSet(mixins.ListModelMixin,
         notifications.notify_developer_assigned(project)
         return self._detail(project)
 
+    def _is_lead(self):
+        user = self.request.user
+        return user.role == Role.DELIVERY_LEAD or user.is_superuser
+
     @action(detail=True, methods=["post"], url_path="submit-review")
     def submit_review(self, request, pk=None):
+        """Hand the work to the client. The assigned developer or the lead can do it —
+        the lead often needs to move it along on the developer's behalf."""
         project = self.get_object()
-        if request.user.role != Role.DEVELOPER or project.developer_id != request.user.id:
-            raise PermissionDenied("Only the assigned developer can submit for review.")
+        is_assigned_dev = (request.user.role == Role.DEVELOPER
+                           and project.developer_id == request.user.id)
+        if not (is_assigned_dev or self._is_lead()):
+            raise PermissionDenied(
+                "Only the assigned developer or a delivery lead can submit for review."
+            )
         if project.stage != Stage.IN_PROGRESS:
             raise ValidationError("This project isn't in progress.")
         project.stage = Stage.REVIEW
         project.save(update_fields=["stage"])
-        log_activity(project, request.user, "Submitted the work for client review.")
+        text = ("Submitted the work for client review."
+                if is_assigned_dev else
+                "Moved the project to review and notified the client.")
+        log_activity(project, request.user, text)
         notifications.notify_submitted_for_review(project)
+        return self._detail(project)
+
+    @action(detail=True, methods=["post"], url_path="remind-review")
+    def remind_review(self, request, pk=None):
+        """Nudge the client again while a project is sitting in review."""
+        project = self.get_object()
+        is_assigned_dev = (request.user.role == Role.DEVELOPER
+                           and project.developer_id == request.user.id)
+        if not (is_assigned_dev or self._is_lead()):
+            raise PermissionDenied("Only the delivery team can send that reminder.")
+        if project.stage != Stage.REVIEW:
+            raise ValidationError("This project isn't waiting on the client's review.")
+        log_activity(project, request.user,
+                     "Reminded the client that the work is ready for review.")
+        notifications.notify_review_reminder(project)
         return self._detail(project)
 
     @action(detail=True, methods=["post"])
     def approve(self, request, pk=None):
+        """Close the project out and release the earnings.
+
+        The client signs their own work off; a delivery lead can also complete it
+        — needed when a client goes quiet and the team is owed their share.
+        """
         project = self.get_object()
-        if request.user.role != Role.CLIENT or project.client_id != request.user.id:
-            raise PermissionDenied("Only the client can approve delivery.")
+        is_client = (request.user.role == Role.CLIENT
+                     and project.client_id == request.user.id)
+        if not (is_client or self._is_lead()):
+            raise PermissionDenied("Only the client or a delivery lead can complete this.")
         if project.stage != Stage.REVIEW:
             raise ValidationError("This project isn't ready for approval.")
         project.stage = Stage.COMPLETED
         project.save(update_fields=["stage"])
-        log_activity(project, request.user, "Approved delivery. Project complete!")
-        notifications.notify_project_completed(project)
+        text = ("Approved delivery. Project complete!"
+                if is_client else
+                "Marked the project complete on the client's behalf.")
+        log_activity(project, request.user, text)
+        notifications.notify_project_completed(project, completed_by_client=is_client)
         credit_earnings(project)
         return self._detail(project)
 

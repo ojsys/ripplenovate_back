@@ -185,16 +185,55 @@ def notify_submitted_for_review(project):
 
 
 @_safe
-def notify_project_completed(project):
+def notify_review_reminder(project):
+    """A second nudge for a client sitting on a review."""
+    send_brand_email(
+        subject=f"Still waiting on your review: {project.title}",
+        to=project.client.email,
+        heading="Your project is ready for review",
+        paragraphs=[
+            f"Hi {project.client.full_name or 'there'},",
+            f"“{project.title}” is finished and waiting for you to take a look.",
+            "Approving the delivery closes the project and releases the funds to the "
+            "team who built it.",
+        ],
+        cta=("Review & approve", _project_url(project)),
+    )
+
+
+@_safe
+def notify_project_completed(project, completed_by_client=True):
+    """Tell the delivery team the work is signed off.
+
+    When a lead closes it out instead of the client, the client is told too — they
+    should never find a project completed without hearing why.
+    """
     recipients = set(_lead_emails())
     if project.developer:
         recipients.add(project.developer.email)
+    who = (f"{_client_name(project)} approved delivery of"
+           if completed_by_client else
+           "The delivery team marked")
     send_brand_email(
         subject=f"Project completed: {project.title}",
         to=recipients,
-        heading="A project was approved 🎉",
+        heading="A project was completed 🎉",
         paragraphs=[
-            f"{_client_name(project)} approved delivery of “{project.title}”. Great work!",
+            f"{who} “{project.title}”. Earnings have been credited to everyone who "
+            "worked on it.",
         ],
         cta=("View the project", _project_url(project)),
     )
+    if not completed_by_client:
+        send_brand_email(
+            subject=f"Project completed: {project.title}",
+            to=project.client.email,
+            heading="Your project has been completed",
+            paragraphs=[
+                f"Hi {project.client.full_name or 'there'},",
+                f"“{project.title}” has been marked complete by the delivery team.",
+                "If anything still needs attention, reply to this email and we'll pick "
+                "it straight up.",
+            ],
+            cta=("View the project", _project_url(project)),
+        )
