@@ -29,7 +29,7 @@ class WithdrawalSerializer(serializers.ModelSerializer):
             "id", "reference", "amount_usd", "currency", "amount_subunit",
             "usd_to_ngn_rate", "bank_name", "bank_account_name", "masked_account",
             "status", "status_label", "note", "processed_at", "created_at",
-            "user_name", "user_role",
+            "user_name", "user_role", "transfer_reference", "failure_reason",
         ]
 
     def get_user_name(self, obj):
@@ -37,10 +37,30 @@ class WithdrawalSerializer(serializers.ModelSerializer):
 
 
 class WithdrawalCreateSerializer(serializers.Serializer):
+    """Only the amount — the destination comes from the saved payout account, so a
+    request can never be pointed at an account Paystack hasn't verified."""
+
     amount_usd = serializers.DecimalField(max_digits=12, decimal_places=2)
+
+
+class PayoutAccountSerializer(serializers.Serializer):
+    """An earner's own bank account. Never exposed to anyone else."""
+
     bank_name = serializers.CharField(max_length=120)
+    bank_code = serializers.CharField(max_length=20)
     bank_account_number = serializers.CharField(max_length=34)
     bank_account_name = serializers.CharField(max_length=150)
+
+    def validate_bank_account_number(self, v):
+        v = v.strip()
+        if not v.isdigit():
+            raise serializers.ValidationError("An account number should be digits only.")
+        return v
+
+
+class ResolveAccountSerializer(serializers.Serializer):
+    bank_code = serializers.CharField(max_length=20)
+    account_number = serializers.CharField(max_length=34)
 
 
 class WithdrawalSettleSerializer(serializers.Serializer):
@@ -52,3 +72,9 @@ class WithdrawalSettleSerializer(serializers.Serializer):
         ]
     )
     note = serializers.CharField(required=False, allow_blank=True, default="")
+    # True records a payout made outside Paystack instead of sending one.
+    manual = serializers.BooleanField(required=False, default=False)
+
+
+class TransferOtpSerializer(serializers.Serializer):
+    otp = serializers.CharField(max_length=12)

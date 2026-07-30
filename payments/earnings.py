@@ -169,16 +169,22 @@ def _reference():
 
 
 @transaction.atomic
-def request_withdrawal(user, amount_usd, bank_name, account_number, account_name):
+def request_withdrawal(user, amount_usd):
     """Validate a payout request against the live balance and record it.
 
-    The balance is re-read inside the transaction so two quick requests can't
-    both clear the same funds.
+    The destination is the earner's saved payout account, snapshotted onto the
+    request — so what gets paid is what was approved, even if they edit their
+    profile afterwards. The balance is re-read inside the transaction so two
+    quick requests can't both clear the same funds.
     """
     from .paystack import charge_amount, usd_to_ngn_rate  # local import: avoids a cycle
 
     if not user.can_earn:
         raise WithdrawalError("Only developers and delivery leads have earnings to withdraw.")
+    if not user.has_payout_account:
+        raise WithdrawalError(
+            "Add your bank account in profile settings before withdrawing."
+        )
 
     amount = _money(amount_usd)
     if amount <= ZERO:
@@ -192,18 +198,6 @@ def request_withdrawal(user, amount_usd, bank_name, account_number, account_name
     if amount > available:
         raise WithdrawalError(f"You can withdraw up to ${available} right now.")
 
-    bank_name = (bank_name or "").strip()
-    account_number = (account_number or "").strip()
-    account_name = (account_name or "").strip()
-    if not (bank_name and account_number and account_name):
-        raise WithdrawalError("Add your bank name, account number, and account name.")
-
-    # Keep the profile in step so the next request is prefilled.
-    user.bank_name = bank_name
-    user.bank_account_number = account_number
-    user.bank_account_name = account_name
-    user.save(update_fields=["bank_name", "bank_account_number", "bank_account_name"])
-
     currency, amount_subunit = charge_amount(amount)
     return Withdrawal.objects.create(
         user=user,
@@ -212,29 +206,53 @@ def request_withdrawal(user, amount_usd, bank_name, account_number, account_name
         currency=currency,
         amount_subunit=amount_subunit,
         usd_to_ngn_rate=usd_to_ngn_rate() if currency == "NGN" else None,
-        bank_name=bank_name,
-        bank_account_number=account_number,
-        bank_account_name=account_name,
+        bank_name=user.bank_name,
+        bank_code=user.bank_code,
+        bank_account_number=user.bank_account_number,
+        bank_account_name=user.bank_account_name,
         status=Withdrawal.Status.REQUESTED,
     )
 
 
-def settle(withdrawal, status, actor, note=""):
-    """Move a request to processing / paid / rejected on someone's behalf.
+def settle(withdrawal, status, actor, note="", manual=False):
+    """Approve, reject, or record a payout on someone's behalf.
+
+    Approving a payout **sends the money**: it creates the Paystack transfer and
+    leaves the withdrawal "sending" until Paystack confirms it (webhook or a
+    verify call). It is never marked paid just because we asked. Pass
+    ``manual=True`` to record a payout made outside Paystack — the same escape
+    hatch as before, and the only path when transfers are switched off.
 
     A delivery lead can't sign off their own payout — that needs a second pair of
     eyes. Superusers are exempt: they can already edit the row in the Django
     admin, so blocking them would be a control in name only (and a lone admin
     would have no way to ever be paid).
     """
+    from . import transfers  # local import: keeps this module free of HTTP concerns
+    from .paystack import PaystackError
+
     if withdrawal.user_id == actor.id and not actor.is_superuser:
         raise WithdrawalError(
             "You can't settle your own withdrawal — ask another delivery lead or an admin."
         )
-    if withdrawal.status in (Withdrawal.Status.PAID, Withdrawal.Status.REJECTED):
+    if withdrawal.status in Withdrawal.FINAL_STATUSES:
         raise WithdrawalError(
             f"This request is already {withdrawal.get_status_display().lower()}."
         )
+
+    sending = (status == Withdrawal.Status.PAID and not manual
+               and transfers.transfers_enabled())
+    if sending:
+        try:
+            transfers.send(withdrawal, actor=actor)
+        except PaystackError as exc:
+            # Nothing moved — leave the request where it was so it can be retried.
+            raise WithdrawalError(str(exc))
+        if note:
+            withdrawal.note = note
+            withdrawal.save(update_fields=["note"])
+        return withdrawal
+
     withdrawal.status = status
     withdrawal.note = note or withdrawal.note
     withdrawal.processed_by = actor

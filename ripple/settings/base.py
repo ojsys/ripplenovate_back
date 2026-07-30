@@ -30,6 +30,7 @@ env = environ.Env(
     FRONTEND_URL=(str, "http://localhost:5180"),
     USD_TO_NGN_RATE=(float, 1600.0),
     PAYSTACK_FEE_PERCENT=(float, 1.5),
+    PAYSTACK_TRANSFERS_ENABLED=(bool, True),
 )
 # Load .env without clobbering real environment variables (so values set in the
 # cPanel Python App UI take precedence over the file).
@@ -135,5 +136,8 @@ DEFAULT_FROM_EMAIL = env(
 PAYSTACK_SECRET_KEY = env("PAYSTACK_SECRET_KEY", default="")
 PAYSTACK_PUBLIC_KEY = env("PAYSTACK_PUBLIC_KEY", default="")
 PAYSTACK_CURRENCY = env("PAYSTACK_CURRENCY", default="NGN").upper()
+# Send approved withdrawals through the Paystack Transfers API. Turn off to run
+# payouts by hand (the admin can still record them as paid).
+PAYSTACK_TRANSFERS_ENABLED = env("PAYSTACK_TRANSFERS_ENABLED", default=True)
 USD_TO_NGN_RATE = env("USD_TO_NGN_RATE")
 PAYSTACK_FEE_PERCENT = env("PAYSTACK_FEE_PERCENT")

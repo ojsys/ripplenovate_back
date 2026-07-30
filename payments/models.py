@@ -77,13 +77,17 @@ class Withdrawal(models.Model):
 
     class Status(models.TextChoices):
         REQUESTED = "requested", "Requested"
-        PROCESSING = "processing", "Processing"
+        PROCESSING = "processing", "Sending"
         PAID = "paid", "Paid"
         REJECTED = "rejected", "Rejected"
+        FAILED = "failed", "Failed"
 
-    # Anything but a rejection is money committed against the balance.
+    # Money is committed while a payout is queued, in flight, or done. A rejected
+    # or failed payout never left, so those amounts go back to the balance.
     COMMITTED_STATUSES = [Status.REQUESTED, Status.PROCESSING, Status.PAID]
     OPEN_STATUSES = [Status.REQUESTED, Status.PROCESSING]
+    # Terminal: no further transitions allowed.
+    FINAL_STATUSES = [Status.PAID, Status.REJECTED]
 
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="withdrawals"
@@ -98,8 +102,15 @@ class Withdrawal(models.Model):
     )
     # Payout destination, snapshotted from the user's profile at request time.
     bank_name = models.CharField(max_length=120)
+    bank_code = models.CharField(max_length=20, blank=True)
     bank_account_number = models.CharField(max_length=34)
     bank_account_name = models.CharField(max_length=150)
+    # Paystack transfer trail. Populated when a payout is actually sent.
+    recipient_code = models.CharField(max_length=100, blank=True)
+    transfer_code = models.CharField(max_length=100, blank=True)
+    transfer_reference = models.CharField(max_length=100, blank=True)
+    transfer_raw = models.JSONField(default=dict, blank=True)
+    failure_reason = models.CharField(max_length=255, blank=True)
     status = models.CharField(max_length=12, choices=Status.choices, default=Status.REQUESTED)
     note = models.TextField(blank=True, help_text="Transfer reference, or why it was rejected.")
     processed_by = models.ForeignKey(

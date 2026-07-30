@@ -14,10 +14,13 @@ from rest_framework.response import Response
 from projects.models import Project
 
 from . import earnings as earnings_service
-from . import notifications, paystack
+from . import notifications, paystack, transfers
 from .models import Earning, Payment, Withdrawal
 from .serializers import (
     EarningSerializer,
+    PayoutAccountSerializer,
+    ResolveAccountSerializer,
+    TransferOtpSerializer,
     WithdrawalCreateSerializer,
     WithdrawalSerializer,
     WithdrawalSettleSerializer,
@@ -115,11 +118,8 @@ def earnings(request):
         "usd_to_ngn_rate": str(paystack.usd_to_ngn_rate()) if currency == "NGN" else None,
         # The headline quotes the site default; this says whether it's the whole story.
         "has_custom_splits": earnings_service.has_custom_splits(user),
-        "payout_account": {
-            "bank_name": user.bank_name,
-            "bank_account_number": user.bank_account_number,
-            "bank_account_name": user.bank_account_name,
-        },
+        "payout_account": _account_payload(user),
+        "transfers_enabled": transfers.transfers_enabled(),
         "earnings": EarningSerializer(
             Earning.objects.filter(user=user).select_related("project"), many=True
         ).data,
@@ -136,6 +136,72 @@ def earnings(request):
     return Response(payload)
 
 
+def _account_payload(user):
+    return {
+        "bank_name": user.bank_name,
+        "bank_code": user.bank_code,
+        "bank_account_number": user.bank_account_number,
+        "bank_account_name": user.bank_account_name,
+        "is_complete": user.has_payout_account,
+    }
+
+
+@api_view(["GET", "PUT"])
+@permission_classes([IsAuthenticated])
+def payout_account(request):
+    """The signed-in earner's own bank account — read and update, nobody else's."""
+    _require_earner(request.user)
+    if request.method == "PUT":
+        serializer = PayoutAccountSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        user = request.user
+        changed = (
+            user.bank_code != data["bank_code"]
+            or user.bank_account_number != data["bank_account_number"]
+        )
+        user.bank_name = data["bank_name"].strip()
+        user.bank_code = data["bank_code"].strip()
+        user.bank_account_number = data["bank_account_number"]
+        user.bank_account_name = data["bank_account_name"].strip()
+        if changed:
+            # A new account needs a new Paystack recipient — never pay the old one.
+            user.paystack_recipient_code = ""
+        user.save(update_fields=[
+            "bank_name", "bank_code", "bank_account_number", "bank_account_name",
+            "paystack_recipient_code",
+        ])
+    return Response(_account_payload(request.user))
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def payout_banks(request):
+    """Banks Paystack can pay into, for the account picker."""
+    _require_earner(request.user)
+    try:
+        return Response({"banks": transfers.list_banks()})
+    except paystack.PaystackError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def resolve_account(request):
+    """Confirm an account number really belongs to the name on it."""
+    _require_earner(request.user)
+    serializer = ResolveAccountSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    try:
+        result = transfers.resolve_account(
+            serializer.validated_data["account_number"],
+            serializer.validated_data["bank_code"],
+        )
+    except paystack.PaystackError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+    return Response(result)
+
+
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def create_withdrawal(request):
@@ -145,11 +211,7 @@ def create_withdrawal(request):
     serializer.is_valid(raise_exception=True)
     try:
         withdrawal = earnings_service.request_withdrawal(
-            request.user,
-            serializer.validated_data["amount_usd"],
-            serializer.validated_data["bank_name"],
-            serializer.validated_data["bank_account_number"],
-            serializer.validated_data["bank_account_name"],
+            request.user, serializer.validated_data["amount_usd"]
         )
     except earnings_service.WithdrawalError as exc:
         return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
@@ -175,10 +237,50 @@ def settle_withdrawal(request, pk):
             serializer.validated_data["status"],
             request.user,
             serializer.validated_data.get("note", ""),
+            manual=serializer.validated_data.get("manual", False),
         )
     except earnings_service.WithdrawalError as exc:
         return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
-    notifications.notify_withdrawal_settled(withdrawal)
+    # "Sending" isn't news for the earner — they hear when it lands or fails.
+    if withdrawal.status != Withdrawal.Status.PROCESSING:
+        notifications.notify_withdrawal_settled(withdrawal)
+    return Response(WithdrawalSerializer(withdrawal).data)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def sync_withdrawal(request, pk):
+    """Re-check a payout with Paystack — for when a webhook hasn't landed."""
+    _require_settler(request.user)
+    withdrawal = Withdrawal.objects.select_related("user").filter(pk=pk).first()
+    if not withdrawal:
+        return Response({"detail": "Withdrawal not found."}, status=status.HTTP_404_NOT_FOUND)
+    before = withdrawal.status
+    try:
+        transfers.verify(withdrawal)
+    except paystack.PaystackError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+    if withdrawal.status != before and withdrawal.status != Withdrawal.Status.PROCESSING:
+        notifications.notify_withdrawal_settled(withdrawal)
+    return Response(WithdrawalSerializer(withdrawal).data)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def finalize_withdrawal(request, pk):
+    """Supply the OTP when Paystack holds a transfer for confirmation."""
+    _require_settler(request.user)
+    withdrawal = Withdrawal.objects.select_related("user").filter(pk=pk).first()
+    if not withdrawal:
+        return Response({"detail": "Withdrawal not found."}, status=status.HTTP_404_NOT_FOUND)
+    serializer = TransferOtpSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    try:
+        transfers.finalize(withdrawal, serializer.validated_data["otp"])
+    except paystack.PaystackError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+    if withdrawal.status != Withdrawal.Status.PROCESSING:
+        notifications.notify_withdrawal_settled(withdrawal)
     return Response(WithdrawalSerializer(withdrawal).data)
 
 
@@ -199,13 +301,21 @@ def paystack_webhook(request):
     except (ValueError, UnicodeDecodeError):
         return HttpResponse(status=400)
 
-    if event.get("event") == "charge.success":
-        reference = event.get("data", {}).get("reference")
+    name = event.get("event")
+    data = event.get("data", {})
+
+    if name == "charge.success":
         payment = Payment.objects.select_related("project", "project__client").filter(
-            reference=reference
+            reference=data.get("reference")
         ).first()
         if payment:
-            paystack._mark_paid(payment, event.get("data", {}))
+            paystack._mark_paid(payment, data)
+
+    # Payouts: Paystack's word is final on whether the money actually moved.
+    elif name in ("transfer.success", "transfer.failed", "transfer.reversed"):
+        withdrawal = transfers.handle_webhook_event(name, data)
+        if withdrawal and withdrawal.status != Withdrawal.Status.PROCESSING:
+            notifications.notify_withdrawal_settled(withdrawal)
 
     # Always 200 so Paystack stops retrying a handled event.
     return HttpResponse(status=200)

@@ -15,9 +15,13 @@ class UserAdmin(BaseUserAdmin):
         (None, {"fields": ("email", "password")}),
         ("Profile", {"fields": ("full_name", "role", "company", "specialty", "active_load")}),
         ("Payout account", {
-            "fields": ("bank_name", "bank_account_number", "bank_account_name"),
+            "fields": ("bank_name", "bank_code", "bank_account_number",
+                       "bank_account_name", "paystack_recipient_code"),
             "description": "Where withdrawals are paid. Developers and delivery leads "
-                           "maintain this themselves when they withdraw earnings.",
+                           "maintain this in their own profile settings; the bank code "
+                           "is Paystack's, and the recipient code is created on the "
+                           "first payout. Clear the recipient code to force it to be "
+                           "recreated.",
         }),
         ("Status", {"fields": ("is_email_verified", "is_active", "is_staff", "is_superuser")}),
         ("Groups", {"fields": ("groups", "user_permissions")}),

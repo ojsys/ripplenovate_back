@@ -64,8 +64,13 @@ class User(AbstractUser):
     # Payout account for earners (developers and delivery leads). Snapshotted onto
     # every Withdrawal so a later edit never rewrites past payout history.
     bank_name = models.CharField(max_length=120, blank=True)
+    # Paystack's bank identifier — required to create a transfer recipient, so a
+    # payout can only be sent once this is set (not just a typed bank name).
+    bank_code = models.CharField(max_length=20, blank=True)
     bank_account_number = models.CharField(max_length=34, blank=True)
     bank_account_name = models.CharField(max_length=150, blank=True)
+    # Paystack transfer recipient, reused across payouts for the same account.
+    paystack_recipient_code = models.CharField(max_length=100, blank=True)
 
     is_email_verified = models.BooleanField(default=False)
 
@@ -98,7 +103,8 @@ class User(AbstractUser):
 
     @property
     def has_payout_account(self):
-        return bool(self.bank_name and self.bank_account_number and self.bank_account_name)
+        """Enough detail to actually send money — a bank code, not just a name."""
+        return bool(self.bank_code and self.bank_account_number and self.bank_account_name)
 
 
 class EmailToken(models.Model):
