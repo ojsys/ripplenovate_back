@@ -29,6 +29,10 @@ RECIPIENT_TYPES = {"NGN": "nuban", "GHS": "mobile_money", "KES": "mobile_money",
 BANK_CACHE_KEY = "ril:paystack:banks:{}"
 BANK_CACHE_TTL = 60 * 60 * 24  # bank lists barely change
 
+# What the earner sees on their bank statement. The payout reference travels
+# separately as the transfer's `reference`, so this stays clean and recognisable.
+TRANSFER_NARRATION = "RIPPLENOVATE LAB Withdrawal"
+
 
 def transfers_enabled():
     return bool(settings.PAYSTACK_TRANSFERS_ENABLED)
@@ -154,7 +158,7 @@ def send(withdrawal, actor=None):
         "amount": withdrawal.amount_subunit,
         "recipient": recipient,
         "currency": withdrawal.currency,
-        "reason": f"Ripple payout {withdrawal.reference}",
+        "reason": TRANSFER_NARRATION,
         "reference": withdrawal.reference,
     })
     withdrawal.recipient_code = recipient
