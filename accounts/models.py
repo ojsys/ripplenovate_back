@@ -9,6 +9,8 @@ from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import DatabaseError, models
 from django.utils import timezone
 
+from .uploads import cv_path, id_document_path, validate_cv, validate_id_document
+
 
 class UserManager(BaseUserManager):
     """Manager for the email-as-username custom user."""
@@ -253,17 +255,21 @@ class User(AbstractUser):
         return bool(self.bank_code and self.bank_account_number and self.bank_account_name)
 
 
-class PartnerProfile(models.Model):
-    """The application a delivery lead or business developer submits.
+class ProfessionalProfile(models.Model):
+    """Who someone is professionally — what they do and what they've delivered.
 
-    One model for both rather than two nearly identical ones: an admin reviewing
-    the queue is asking the same questions of each — who are you, what have you
-    delivered, who can vouch for you. The role on the user says which queue it
-    belongs to, and `team_size_target` is simply blank for a business developer.
+    Shared by everyone who works on the platform: it started as the delivery-lead
+    and business-developer application, and experts fill in the same shape of
+    information. An admin reviewing an application and a lead deciding who to
+    assign are both asking "what can this person do", so it's one model.
+
+    **This is the non-sensitive half.** A delivery lead can read their own
+    experts' profiles, because staffing a brief requires it. Identity documents
+    live in `KycProfile`, which a lead can never see.
     """
 
     user = models.OneToOneField(
-        User, on_delete=models.CASCADE, related_name="partner_profile"
+        User, on_delete=models.CASCADE, related_name="professional_profile"
     )
     bio = models.TextField(blank=True)
     country = models.CharField(max_length=80, blank=True)
@@ -277,11 +283,165 @@ class PartnerProfile(models.Model):
         blank=True, help_text="What they've delivered before — the heart of the review.",
     )
     references_note = models.TextField("References", blank=True)
+
+    # --- Expert-facing detail: what a lead needs to staff a brief well ---
+    cv = models.FileField(
+        "CV / résumé", upload_to=cv_path, blank=True, null=True,
+        validators=[validate_cv],
+        help_text="PDF or Word document, up to 5MB. Visible to their delivery lead.",
+    )
+    cv_uploaded_at = models.DateTimeField(null=True, blank=True)
+    languages = models.JSONField(
+        default=list, blank=True,
+        help_text='Languages they work in, e.g. ["English", "French"].',
+    )
+    certifications = models.TextField(
+        blank=True, help_text="Qualifications and certifications, one per line.",
+    )
+    availability_hours = models.PositiveIntegerField(
+        "Availability (hours/week)", null=True, blank=True,
+        validators=[MaxValueValidator(168)],
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
-        return f"{self.user} · application"
+        return f"{self.user} · professional profile"
+
+    @property
+    def cv_filename(self):
+        """The stored name is a UUID; show something a person can recognise."""
+        if not self.cv:
+            return ""
+        from pathlib import Path as _Path
+        return f"CV{_Path(self.cv.name).suffix}"
+
+
+class KycProfile(models.Model):
+    """Identity verification for anyone the platform pays.
+
+    Kept apart from `ProfessionalProfile` on purpose. A delivery lead reads their
+    experts' professional profiles to staff work; nobody but the person
+    themselves and an admin reviewing verification should ever see a date of
+    birth, a home address or a passport number. Separate models make that a
+    structural boundary rather than a field-by-field filter somebody forgets to
+    apply.
+
+    Deliberately minimal: enough to know who is being paid and that they are who
+    they say, and nothing more. No biometrics, no bank statements, no
+    next-of-kin.
+    """
+
+    class Status(models.TextChoices):
+        UNSUBMITTED = "unsubmitted", "Not submitted"
+        PENDING = "pending", "Awaiting review"
+        VERIFIED = "verified", "Verified"
+        REJECTED = "rejected", "Rejected"
+
+    class IdType(models.TextChoices):
+        PASSPORT = "passport", "Passport"
+        NATIONAL_ID = "national_id", "National ID card"
+        DRIVERS_LICENCE = "drivers_licence", "Driver's licence"
+        VOTERS_CARD = "voters_card", "Voter's card"
+
+    user = models.OneToOneField(
+        User, on_delete=models.CASCADE, related_name="kyc"
+    )
+    # The name on the identity document, which is often not the display name.
+    legal_name = models.CharField(max_length=150, blank=True)
+    date_of_birth = models.DateField(null=True, blank=True)
+    phone = models.CharField(max_length=32, blank=True)
+
+    address_line1 = models.CharField("Address", max_length=200, blank=True)
+    address_line2 = models.CharField("Address line 2", max_length=200, blank=True)
+    city = models.CharField(max_length=100, blank=True)
+    state = models.CharField("State / region", max_length=100, blank=True)
+    postal_code = models.CharField(max_length=20, blank=True)
+    country = models.CharField(max_length=80, blank=True)
+
+    id_type = models.CharField(max_length=20, choices=IdType.choices, blank=True)
+    id_number = models.CharField(
+        max_length=60, blank=True,
+        help_text="Sensitive. Returned masked by the API to everyone except the "
+                  "person themselves; never included in list endpoints.",
+    )
+    id_document = models.FileField(
+        "ID document", upload_to=id_document_path, blank=True, null=True,
+        validators=[validate_id_document],
+    )
+    # Tax reference, where the person's jurisdiction issues one.
+    tax_id = models.CharField("Tax ID / TIN", max_length=60, blank=True)
+
+    status = models.CharField(
+        max_length=12, choices=Status.choices, default=Status.UNSUBMITTED
+    )
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    reviewed_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="reviewed_kyc",
+    )
+    rejection_reason = models.TextField(
+        blank=True, help_text="Shown to the person, so write it for them to read.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "KYC record"
+        verbose_name_plural = "KYC records"
+
+    def __str__(self):
+        return f"{self.user} · {self.get_status_display()}"
+
+    # Everything needed before a submission can be reviewed at all.
+    REQUIRED = ["legal_name", "date_of_birth", "phone", "address_line1",
+                "city", "country", "id_type", "id_number"]
+
+    @property
+    def missing_fields(self):
+        missing = [f for f in self.REQUIRED if not getattr(self, f)]
+        if not self.id_document:
+            missing.append("id_document")
+        return missing
+
+    @property
+    def is_complete(self):
+        return not self.missing_fields
+
+    @property
+    def is_verified(self):
+        return self.status == self.Status.VERIFIED
+
+    @property
+    def masked_id_number(self):
+        """Last four only — enough to confirm which document, useless if leaked."""
+        if not self.id_number:
+            return ""
+        tail = self.id_number[-4:]
+        return f"•••• {tail}"
+
+    def submit(self):
+        self.status = self.Status.PENDING
+        self.submitted_at = timezone.now()
+        self.rejection_reason = ""
+        self.save(update_fields=["status", "submitted_at", "rejection_reason"])
+
+    def verify(self, by=None):
+        self.status = self.Status.VERIFIED
+        self.reviewed_at = timezone.now()
+        self.reviewed_by = by
+        self.rejection_reason = ""
+        self.save(update_fields=["status", "reviewed_at", "reviewed_by",
+                                 "rejection_reason"])
+
+    def reject(self, reason="", by=None):
+        self.status = self.Status.REJECTED
+        self.reviewed_at = timezone.now()
+        self.reviewed_by = by
+        self.rejection_reason = reason
+        self.save(update_fields=["status", "reviewed_at", "reviewed_by",
+                                 "rejection_reason"])
 
 
 def _invite_expiry():
@@ -417,6 +577,14 @@ class SiteSettings(models.Model):
                   "on completion. Charged only on projects that have one — a direct "
                   "project keeps this in the platform's share.",
     )
+    require_kyc_for_payout = models.BooleanField(
+        "Require identity verification before payout",
+        default=False,
+        help_text="When on, an expert, delivery lead or business developer must be "
+                  "KYC-verified before they can withdraw. Left OFF by default so "
+                  "turning KYC on never silently strands people who are already "
+                  "owed money — switch it on once your team is verified.",
+    )
     min_withdrawal_usd = models.DecimalField(
         "Minimum withdrawal (USD)",
         max_digits=10,
@@ -496,7 +664,8 @@ class SiteSettings(models.Model):
         Read-only (no row is created) so it's safe on the earnings path.
         """
         fields = ("expert_share_percent", "delivery_lead_share_percent",
-                  "business_dev_share_percent", "min_withdrawal_usd")
+                  "business_dev_share_percent", "min_withdrawal_usd",
+                  "require_kyc_for_payout")
         try:
             row = cls.objects.values(*fields).first()
         except DatabaseError:  # table not migrated yet
@@ -515,4 +684,5 @@ class SiteSettings(models.Model):
             "business_dev_share_percent": pick("business_dev_share_percent",
                                                cls.DEFAULT_BUSINESS_DEV_SHARE),
             "min_withdrawal_usd": pick("min_withdrawal_usd", cls.DEFAULT_MIN_WITHDRAWAL),
+            "require_kyc_for_payout": bool(row.get("require_kyc_for_payout")),
         }

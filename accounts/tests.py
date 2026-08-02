@@ -9,7 +9,7 @@ from django.test import TestCase
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from accounts.models import Invitation, PartnerProfile
+from accounts.models import Invitation, ProfessionalProfile
 from catalog.models import ProductLine
 from projects.models import Project
 
@@ -43,7 +43,7 @@ class SignupForkTests(TestCase):
         self.assertEqual(user.role, User.Role.DELIVERY_LEAD)
         self.assertEqual(user.approval_status, User.ApprovalStatus.PENDING)
         self.assertFalse(user.is_approved)
-        self.assertTrue(PartnerProfile.objects.filter(user=user).exists())
+        self.assertTrue(ProfessionalProfile.objects.filter(user=user).exists())
 
     def test_a_business_dev_signup_starts_pending_with_a_referral_code(self):
         self.assertEqual(self.register(role="business_dev").status_code, 201)
@@ -191,7 +191,7 @@ class ApplicationReviewTests(TestCase):
             role=User.Role.DELIVERY_LEAD,
             approval_status=User.ApprovalStatus.PENDING,
             applied_at=timezone.now())
-        PartnerProfile.objects.create(user=self.applicant, country="Kenya")
+        ProfessionalProfile.objects.create(user=self.applicant, country="Kenya")
 
     def test_the_queue_lists_pending_applications_with_their_profile(self):
         response = as_user(self.admin).get("/api/applications")

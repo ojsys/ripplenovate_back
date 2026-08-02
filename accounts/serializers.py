@@ -3,7 +3,7 @@ from rest_framework import serializers
 
 from catalog.serializers import ProductLineBriefSerializer
 
-from .models import Invitation, PartnerProfile, User
+from .models import Invitation, KycProfile, ProfessionalProfile, User
 
 
 class UserSerializer(serializers.ModelSerializer):
@@ -79,7 +79,7 @@ class RegisterSerializer(serializers.ModelSerializer):
             **validated_data
         )
         if role in User.APPROVAL_ROLES:
-            PartnerProfile.objects.create(user=user)
+            ProfessionalProfile.objects.create(user=user)
         if role == User.Role.BUSINESS_DEV:
             user.ensure_referral_code()
         return user
@@ -143,11 +143,11 @@ class PasswordResetConfirmSerializer(serializers.Serializer):
     password = serializers.CharField(validators=[validate_password])
 
 
-class PartnerProfileSerializer(serializers.ModelSerializer):
+class ProfessionalProfileSerializer(serializers.ModelSerializer):
     """The application a delivery lead or business developer fills in."""
 
     class Meta:
-        model = PartnerProfile
+        model = ProfessionalProfile
         fields = ["bio", "country", "timezone_name", "years_experience",
                   "linkedin_url", "portfolio_url", "team_size_target",
                   "past_delivery", "references_note"]
@@ -172,7 +172,7 @@ class OnboardingSerializer(serializers.Serializer):
         child=serializers.SlugField(), required=False
     )
     onboarding_step = serializers.IntegerField(required=False, min_value=0)
-    profile = PartnerProfileSerializer(required=False)
+    profile = ProfessionalProfileSerializer(required=False)
 
 
 class InvitationSerializer(serializers.ModelSerializer):
@@ -218,4 +218,98 @@ class InvitationAcceptSerializer(serializers.Serializer):
 
 class ApprovalDecisionSerializer(serializers.Serializer):
     decision = serializers.ChoiceField(choices=["approve", "reject"])
+    reason = serializers.CharField(required=False, allow_blank=True)
+
+
+class ProfessionalProfileDetailSerializer(serializers.ModelSerializer):
+    """The professional half of a profile — safe for a delivery lead to read."""
+
+    cv_filename = serializers.CharField(read_only=True)
+    has_cv = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ProfessionalProfile
+        fields = ["bio", "country", "timezone_name", "years_experience",
+                  "linkedin_url", "portfolio_url", "team_size_target",
+                  "past_delivery", "references_note",
+                  "languages", "certifications", "availability_hours",
+                  "has_cv", "cv_filename", "cv_uploaded_at"]
+        read_only_fields = ["has_cv", "cv_filename", "cv_uploaded_at"]
+        extra_kwargs = {
+            field: {"required": False}
+            for field in ["bio", "country", "timezone_name", "years_experience",
+                          "linkedin_url", "portfolio_url", "team_size_target",
+                          "past_delivery", "references_note", "languages",
+                          "certifications", "availability_hours"]
+        }
+
+    def get_has_cv(self, obj):
+        return bool(obj.cv)
+
+
+class KycSerializer(serializers.ModelSerializer):
+    """Identity details.
+
+    `id_number` is write-only: it goes in, and comes back only as
+    `id_number_masked`. Even the owner reading their own record gets the mask —
+    they know their own passport number, and not echoing it means a shoulder-surf
+    or a cached response never exposes it.
+    """
+
+    id_number = serializers.CharField(
+        write_only=True, required=False, allow_blank=True, max_length=60
+    )
+    id_number_masked = serializers.CharField(
+        source="masked_id_number", read_only=True
+    )
+    has_id_document = serializers.SerializerMethodField()
+    missing_fields = serializers.ListField(read_only=True)
+    is_complete = serializers.BooleanField(read_only=True)
+    status_label = serializers.CharField(source="get_status_display", read_only=True)
+
+    class Meta:
+        model = KycProfile
+        fields = ["legal_name", "date_of_birth", "phone",
+                  "address_line1", "address_line2", "city", "state",
+                  "postal_code", "country", "id_type", "id_number",
+                  "id_number_masked", "tax_id", "has_id_document",
+                  "status", "status_label", "submitted_at", "reviewed_at",
+                  "rejection_reason", "missing_fields", "is_complete"]
+        read_only_fields = ["status", "status_label", "submitted_at", "reviewed_at",
+                            "rejection_reason", "missing_fields", "is_complete",
+                            "id_number_masked", "has_id_document"]
+        extra_kwargs = {
+            field: {"required": False}
+            for field in ["legal_name", "date_of_birth", "phone", "address_line1",
+                          "address_line2", "city", "state", "postal_code",
+                          "country", "id_type", "tax_id"]
+        }
+
+    def get_has_id_document(self, obj):
+        return bool(obj.id_document)
+
+
+class KycReviewSerializer(KycSerializer):
+    """What an admin reviewing a submission sees — the person, plus their record.
+
+    Still no raw ID number: the reviewer compares the uploaded document against
+    the typed details, and the document is what carries the number.
+    """
+
+    user_id = serializers.IntegerField(source="user.id", read_only=True)
+    user_name = serializers.SerializerMethodField()
+    user_email = serializers.EmailField(source="user.email", read_only=True)
+    user_role = serializers.CharField(source="user.role_label", read_only=True)
+
+    class Meta(KycSerializer.Meta):
+        fields = KycSerializer.Meta.fields + [
+            "user_id", "user_name", "user_email", "user_role",
+        ]
+
+    def get_user_name(self, obj):
+        return obj.user.full_name or obj.user.email
+
+
+class KycDecisionSerializer(serializers.Serializer):
+    decision = serializers.ChoiceField(choices=["verify", "reject"])
     reason = serializers.CharField(required=False, allow_blank=True)

@@ -105,6 +105,22 @@ USE_TZ = True
 STATIC_URL = "static/"
 # collectstatic writes here; WhiteNoise serves it in production.
 STATIC_ROOT = BASE_DIR / "staticfiles"
+
+# Uploaded documents — CVs and identity papers.
+#
+# These are NOT served by the web server. MEDIA_URL is deliberately unset: every
+# file goes out through an authenticated Django view instead, so a CV or a
+# passport scan is never reachable by anyone who happens to have (or guess) a
+# URL. Keep MEDIA_ROOT outside the public web root in production.
+#
+# To move to object storage later, install django-storages and set
+# DEFAULT_FILE_STORAGE — nothing else here changes, and the download view keeps
+# working because it streams through the storage API rather than the filesystem.
+MEDIA_ROOT = BASE_DIR / "private-media"
+
+# Uploads are people's documents, not bulk data: a few MB is plenty, and a cap
+# keeps a mistaken 400MB video from filling the disk.
+MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # Django REST Framework + JWT

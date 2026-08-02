@@ -235,3 +235,59 @@ def send_application_rejected(user, reason=""):
         heading="About your application",
         paragraphs=paragraphs,
     )
+
+
+def notify_admins_of_kyc(user):
+    """Put a submitted identity record in front of whoever reviews them."""
+    from .models import User as UserModel
+
+    admins = list(
+        UserModel.objects.filter(is_superuser=True, is_active=True)
+        .values_list("email", flat=True)
+    )
+    if not admins:
+        return
+    send_brand_email(
+        subject=f"Identity verification submitted: {user.full_name or user.email}",
+        to=set(admins),
+        heading="An identity record needs review",
+        paragraphs=[
+            f"{user.full_name or user.email} ({user.role_label}) has submitted their "
+            "identity details for verification.",
+        ],
+        cta=("Review verifications", _link("/verifications")),
+    )
+
+
+def send_kyc_verified(user):
+    send_brand_email(
+        subject="Your identity has been verified",
+        to=user.email,
+        heading="You're verified ✓",
+        paragraphs=[
+            f"Hi {_first_name(user)},",
+            "Your identity has been verified. Nothing else is needed from you — "
+            "your payouts can be processed normally.",
+        ],
+        cta=("Open your profile", _link("/profile")),
+    )
+
+
+def send_kyc_rejected(user, reason=""):
+    paragraphs = [
+        f"Hi {_first_name(user)},",
+        "We weren't able to verify your identity with the details you submitted.",
+    ]
+    if reason:
+        paragraphs.append(f"What we need: {reason}")
+    paragraphs.append(
+        "Update your details in your profile and submit again — this is usually a "
+        "blurred photo or a name that doesn't match the document."
+    )
+    send_brand_email(
+        subject="We couldn't verify your identity",
+        to=user.email,
+        heading="About your verification",
+        paragraphs=paragraphs,
+        cta=("Update my details", _link("/profile")),
+    )

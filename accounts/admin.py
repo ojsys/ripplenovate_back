@@ -4,14 +4,21 @@ from django.utils.html import format_html
 
 from django.utils import timezone
 
-from .models import EmailToken, Invitation, PartnerProfile, SiteSettings, User
+from .models import (
+    EmailToken,
+    Invitation,
+    KycProfile,
+    ProfessionalProfile,
+    SiteSettings,
+    User,
+)
 
 
-class PartnerProfileInline(admin.StackedInline):
-    model = PartnerProfile
+class ProfessionalProfileInline(admin.StackedInline):
+    model = ProfessionalProfile
     extra = 0
     can_delete = False
-    verbose_name_plural = "Partner application"
+    verbose_name_plural = "Professional profile"
 
 
 @admin.register(User)
@@ -21,7 +28,7 @@ class UserAdmin(BaseUserAdmin):
                     "is_email_verified", "is_staff")
     list_filter = ("role", "approval_status", "is_email_verified", "is_staff")
     search_fields = ("email", "full_name", "company")
-    inlines = [PartnerProfileInline]
+    inlines = [ProfessionalProfileInline]
     actions = ["approve_applications", "reject_applications"]
 
     @admin.action(description="Approve selected partner applications")
@@ -120,7 +127,7 @@ class SiteSettingsAdmin(admin.ModelAdmin):
         ("Earnings & payouts", {
             "fields": ("default_split", "expert_share_percent",
                        "delivery_lead_share_percent", "business_dev_share_percent",
-                       "min_withdrawal_usd"),
+                       "min_withdrawal_usd", "require_kyc_for_payout"),
             "description": "The default split for every project's quote when the client "
                            "approves delivery. Whatever the others don't claim stays with "
                            "the platform. The business developer commission is charged "
@@ -190,8 +197,78 @@ class InvitationAdmin(admin.ModelAdmin):
         return f"in {days} day{'s' if days != 1 else ''}"
 
 
-@admin.register(PartnerProfile)
-class PartnerProfileAdmin(admin.ModelAdmin):
-    list_display = ("user", "country", "years_experience", "updated_at")
+@admin.register(ProfessionalProfile)
+class ProfessionalProfileAdmin(admin.ModelAdmin):
+    list_display = ("user", "country", "years_experience", "has_cv", "updated_at")
     search_fields = ("user__email", "user__full_name", "country")
     autocomplete_fields = ("user",)
+
+    @admin.display(description="CV", boolean=True)
+    def has_cv(self, obj):
+        return bool(obj.cv)
+
+
+@admin.register(KycProfile)
+class KycProfileAdmin(admin.ModelAdmin):
+    """Identity records.
+
+    The raw ID number is intentionally read-only here rather than editable: an
+    admin's job is to check the typed details against the uploaded document, not
+    to retype someone's passport number. Restrict this model's permission to the
+    people who actually do verification.
+    """
+
+    list_display = ("user", "status", "legal_name", "country", "id_type",
+                    "masked_id", "submitted_at", "reviewed_by")
+    list_filter = ("status", "id_type", "country")
+    search_fields = ("user__email", "user__full_name", "legal_name")
+    autocomplete_fields = ("user", "reviewed_by")
+    readonly_fields = ("masked_id", "submitted_at", "reviewed_at", "created_at",
+                       "updated_at")
+    actions = ["mark_verified", "mark_rejected"]
+    fieldsets = (
+        ("Person", {"fields": ("user", "legal_name", "date_of_birth", "phone")}),
+        ("Address", {
+            "fields": ("address_line1", "address_line2", "city", "state",
+                       "postal_code", "country"),
+        }),
+        ("Identity document", {
+            "fields": ("id_type", "id_number", "masked_id", "id_document", "tax_id"),
+            "description": "Check the typed details against the uploaded document. "
+                           "The document is downloaded through an authenticated "
+                           "view — it is never served from a public URL.",
+        }),
+        ("Review", {
+            "fields": ("status", "submitted_at", "reviewed_at", "reviewed_by",
+                       "rejection_reason"),
+            "description": "The rejection reason is emailed to the person, so write "
+                           "it for them to read — usually a blurred photo or a name "
+                           "that doesn't match.",
+        }),
+    )
+
+    @admin.display(description="ID number")
+    def masked_id(self, obj):
+        return obj.masked_id_number or "—"
+
+    @admin.action(description="Mark selected as verified")
+    def mark_verified(self, request, queryset):
+        from .emails import send_kyc_verified
+
+        count = 0
+        for kyc in queryset.exclude(status=KycProfile.Status.VERIFIED):
+            kyc.verify(by=request.user)
+            send_kyc_verified(kyc.user)
+            count += 1
+        self.message_user(request, f"Verified {count} record(s).")
+
+    @admin.action(description="Mark selected as rejected")
+    def mark_rejected(self, request, queryset):
+        from .emails import send_kyc_rejected
+
+        count = 0
+        for kyc in queryset.exclude(status=KycProfile.Status.REJECTED):
+            kyc.reject(by=request.user)
+            send_kyc_rejected(kyc.user)
+            count += 1
+        self.message_user(request, f"Rejected {count} record(s).")

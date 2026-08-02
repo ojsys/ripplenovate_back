@@ -18,6 +18,16 @@ urlpatterns = [
     path("users/business-developers", views.business_developers),
     path("users/<int:user_id>", views.update_expert),
     path("users/<int:user_id>/role", views.update_role),
+    # Profile: professional detail, CV, and identity verification
+    path("profile/professional", views.my_professional_profile),
+    path("profile/cv", views.my_cv),
+    path("profile/kyc", views.my_kyc),
+    path("profile/kyc/document", views.my_id_document),
+    path("profile/kyc/submit", views.submit_kyc),
+    path("verifications", views.kyc_queue),
+    path("verifications/<int:user_id>/decide", views.decide_kyc),
+    # Documents are streamed through an auth check, never served statically.
+    path("documents/<str:kind>/<int:user_id>", views.download_document),
     # Partner onboarding & approval
     path("onboarding", views.onboarding),
     path("onboarding/submit", views.submit_application),

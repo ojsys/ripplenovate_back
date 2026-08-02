@@ -1,6 +1,9 @@
 import uuid
+from pathlib import Path
 
 from django.contrib.auth import get_user_model
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.http import FileResponse, Http404
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
@@ -13,6 +16,7 @@ from catalog.models import ProductLine
 
 from .emails import (
     notify_admins_of_application,
+    notify_admins_of_kyc,
     notify_lead_invitation_accepted,
     send_application_received,
     send_application_rejected,
@@ -20,13 +24,25 @@ from .emails import (
     send_delivery_lead_welcome,
     send_expert_invitation,
     send_expert_welcome,
+    send_kyc_rejected,
+    send_kyc_verified,
     send_password_reset_email,
     send_verification_email,
     send_welcome_client,
 )
-from .models import EmailToken, Invitation, PartnerProfile, SiteSettings
+from .models import (
+    EmailToken,
+    Invitation,
+    KycProfile,
+    ProfessionalProfile,
+    SiteSettings,
+)
 from .serializers import (
     ApprovalDecisionSerializer,
+    KycDecisionSerializer,
+    KycReviewSerializer,
+    KycSerializer,
+    ProfessionalProfileDetailSerializer,
     ChangePasswordSerializer,
     ExpertCreateSerializer,
     ExpertUpdateSerializer,
@@ -34,13 +50,14 @@ from .serializers import (
     InvitationCreateSerializer,
     InvitationSerializer,
     OnboardingSerializer,
-    PartnerProfileSerializer,
+    ProfessionalProfileSerializer,
     PasswordResetConfirmSerializer,
     ProfileUpdateSerializer,
     RegisterSerializer,
     RoleUpdateSerializer,
     UserSerializer,
 )
+from .uploads import validate_cv, validate_id_document
 
 User = get_user_model()
 
@@ -310,7 +327,7 @@ def onboarding(request):
     if not user.needs_approval:
         raise PermissionDenied("Onboarding is for delivery leads and business developers.")
 
-    profile, _ = PartnerProfile.objects.get_or_create(user=user)
+    profile, _ = ProfessionalProfile.objects.get_or_create(user=user)
 
     if request.method == "PATCH":
         serializer = OnboardingSerializer(data=request.data)
@@ -341,7 +358,7 @@ def onboarding(request):
 
     return Response({
         "user": UserSerializer(user).data,
-        "profile": PartnerProfileSerializer(profile).data,
+        "profile": ProfessionalProfileSerializer(profile).data,
         "team_size": user.team_members.count(),
         "pending_invitations": user.sent_invitations.filter(
             status=Invitation.Status.PENDING).count(),
@@ -360,7 +377,7 @@ def submit_application(request):
         return Response({"detail": "Your account is already approved."},
                         status=status.HTTP_400_BAD_REQUEST)
 
-    profile = PartnerProfile.objects.filter(user=user).first()
+    profile = ProfessionalProfile.objects.filter(user=user).first()
     missing = []
     if not user.full_name.strip():
         missing.append("your name")
@@ -397,14 +414,14 @@ def applications(request):
         raise PermissionDenied("Only an admin can review applications.")
     qs = (User.objects
           .filter(approval_status=User.ApprovalStatus.PENDING)
-          .select_related("partner_profile")
+          .select_related("professional_profile")
           .prefetch_related("product_lines")
           .order_by("applied_at"))
     return Response([
         {
             **UserSerializer(user).data,
-            "profile": (PartnerProfileSerializer(user.partner_profile).data
-                        if hasattr(user, "partner_profile") else None),
+            "profile": (ProfessionalProfileSerializer(user.professional_profile).data
+                        if hasattr(user, "professional_profile") else None),
             "applied_at": user.applied_at,
         }
         for user in qs
@@ -594,3 +611,228 @@ def accept_invitation(request, token):
          "detail": "Welcome aboard — your account is ready."},
         status=status.HTTP_201_CREATED,
     )
+
+
+# ---------------------------------------------------------------------------
+# Profile: professional detail, documents, and identity verification
+# ---------------------------------------------------------------------------
+
+def _may_read_professional(viewer, owner):
+    """A person's own profile, their delivery lead's view of it, or an admin's.
+
+    A lead needs this to staff a brief — it's the CV and the skills. It is
+    deliberately narrower than "any lead": only the lead this expert actually
+    works under.
+    """
+    return (
+        viewer.id == owner.id
+        or viewer.is_superuser
+        or (viewer.role == User.Role.DELIVERY_LEAD and owner.lead_id == viewer.id)
+    )
+
+
+@api_view(["GET", "PATCH"])
+@permission_classes([IsAuthenticated])
+def my_professional_profile(request):
+    """Read or update the signed-in user's professional profile."""
+    profile, _ = ProfessionalProfile.objects.get_or_create(user=request.user)
+    if request.method == "PATCH":
+        serializer = ProfessionalProfileDetailSerializer(
+            profile, data=request.data, partial=True
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+    return Response(ProfessionalProfileDetailSerializer(profile).data)
+
+
+@api_view(["POST", "DELETE"])
+@permission_classes([IsAuthenticated])
+def my_cv(request):
+    """Upload or remove the signed-in user's CV."""
+    profile, _ = ProfessionalProfile.objects.get_or_create(user=request.user)
+
+    if request.method == "DELETE":
+        if profile.cv:
+            profile.cv.delete(save=False)
+        profile.cv = None
+        profile.cv_uploaded_at = None
+        profile.save(update_fields=["cv", "cv_uploaded_at"])
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    upload = request.FILES.get("cv")
+    if not upload:
+        return Response({"detail": "Choose a file to upload."},
+                        status=status.HTTP_400_BAD_REQUEST)
+    try:
+        validate_cv(upload)
+    except DjangoValidationError as exc:
+        return Response({"detail": " ".join(exc.messages)},
+                        status=status.HTTP_400_BAD_REQUEST)
+
+    # Replacing a CV removes the old file rather than orphaning it on disk.
+    if profile.cv:
+        profile.cv.delete(save=False)
+    profile.cv = upload
+    profile.cv_uploaded_at = timezone.now()
+    profile.save(update_fields=["cv", "cv_uploaded_at"])
+    return Response(ProfessionalProfileDetailSerializer(profile).data,
+                    status=status.HTTP_201_CREATED)
+
+
+@api_view(["GET", "PATCH"])
+@permission_classes([IsAuthenticated])
+def my_kyc(request):
+    """Read or update the signed-in user's identity record.
+
+    Editing a record that's already verified would let someone swap their
+    identity after being cleared, so verified records are frozen — a genuine
+    change (a new passport, a house move) goes through an admin.
+    """
+    if not request.user.can_earn and request.user.role != User.Role.EXPERT:
+        raise PermissionDenied("Identity verification is for people the platform pays.")
+
+    kyc, _ = KycProfile.objects.get_or_create(user=request.user)
+    if request.method == "PATCH":
+        if kyc.is_verified:
+            return Response(
+                {"detail": "Your identity is already verified. Contact support if "
+                           "your details have changed."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        serializer = KycSerializer(kyc, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        kyc.refresh_from_db()
+    return Response(KycSerializer(kyc).data)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def my_id_document(request):
+    """Upload the signed-in user's identity document."""
+    kyc, _ = KycProfile.objects.get_or_create(user=request.user)
+    if kyc.is_verified:
+        return Response({"detail": "Your identity is already verified."},
+                        status=status.HTTP_400_BAD_REQUEST)
+
+    upload = request.FILES.get("document")
+    if not upload:
+        return Response({"detail": "Choose a file to upload."},
+                        status=status.HTTP_400_BAD_REQUEST)
+    try:
+        validate_id_document(upload)
+    except DjangoValidationError as exc:
+        return Response({"detail": " ".join(exc.messages)},
+                        status=status.HTTP_400_BAD_REQUEST)
+
+    if kyc.id_document:
+        kyc.id_document.delete(save=False)
+    kyc.id_document = upload
+    kyc.save(update_fields=["id_document"])
+    return Response(KycSerializer(kyc).data, status=status.HTTP_201_CREATED)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def submit_kyc(request):
+    """Send an identity record for review."""
+    kyc, _ = KycProfile.objects.get_or_create(user=request.user)
+    if kyc.is_verified:
+        return Response({"detail": "Already verified."},
+                        status=status.HTTP_400_BAD_REQUEST)
+    if not kyc.is_complete:
+        return Response(
+            {"detail": "Some details are still missing.",
+             "missing": kyc.missing_fields},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    kyc.submit()
+    notify_admins_of_kyc(request.user)
+    return Response(KycSerializer(kyc).data)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def kyc_queue(request):
+    """Identity records awaiting review. Admins only — never a delivery lead."""
+    if not request.user.is_superuser:
+        raise PermissionDenied("Only an admin can review identity documents.")
+    qs = (KycProfile.objects
+          .filter(status=KycProfile.Status.PENDING)
+          .select_related("user")
+          .order_by("submitted_at"))
+    return Response(KycReviewSerializer(qs, many=True).data)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def decide_kyc(request, user_id):
+    if not request.user.is_superuser:
+        raise PermissionDenied("Only an admin can review identity documents.")
+    kyc = KycProfile.objects.filter(user_id=user_id).select_related("user").first()
+    if not kyc:
+        return Response({"detail": "No identity record found."},
+                        status=status.HTTP_404_NOT_FOUND)
+
+    serializer = KycDecisionSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    if serializer.validated_data["decision"] == "verify":
+        kyc.verify(by=request.user)
+        send_kyc_verified(kyc.user)
+    else:
+        reason = serializer.validated_data.get("reason", "")
+        kyc.reject(reason=reason, by=request.user)
+        send_kyc_rejected(kyc.user, reason)
+    return Response(KycReviewSerializer(kyc).data)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def download_document(request, kind, user_id):
+    """Stream a CV or an identity document to someone entitled to see it.
+
+    These files are never served by the web server. A CV is a person's work
+    history and an ID document is their passport — a guessable static URL would
+    put both a link away from anyone on the internet. Everything goes through
+    this check instead.
+
+    Who may read what:
+      * **CV** — the owner, their delivery lead, or an admin.
+      * **ID document** — the owner or an admin. Never a delivery lead: staffing
+        a project needs a CV, not a date of birth.
+    """
+    owner = User.objects.filter(id=user_id).first()
+    if not owner:
+        raise Http404
+
+    if kind == "cv":
+        profile = getattr(owner, "professional_profile", None)
+        handle = profile.cv if profile else None
+        allowed = _may_read_professional(request.user, owner)
+        download_name = f"{(owner.full_name or owner.email).replace(' ', '-')}-CV"
+    elif kind == "id":
+        kyc = getattr(owner, "kyc", None)
+        handle = kyc.id_document if kyc else None
+        allowed = request.user.id == owner.id or request.user.is_superuser
+        download_name = f"{(owner.full_name or owner.email).replace(' ', '-')}-ID"
+    else:
+        raise Http404
+
+    if not allowed:
+        raise PermissionDenied("You can't view this document.")
+    if not handle:
+        raise Http404
+
+    # 404 rather than 500 when the row points at a file that's gone — a missing
+    # file is "not found", and the difference matters when storage is remote.
+    try:
+        stream = handle.open("rb")
+    except (FileNotFoundError, OSError):
+        raise Http404
+
+    suffix = Path(handle.name).suffix
+    response = FileResponse(stream, as_attachment=True,
+                            filename=f"{download_name}{suffix}")
+    # These are personal documents: never let a proxy or the browser keep a copy.
+    response["Cache-Control"] = "no-store, private"
+    return response

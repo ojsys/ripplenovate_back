@@ -201,6 +201,16 @@ def request_withdrawal(user, amount_usd):
         raise WithdrawalError(
             "Add your bank account in profile settings before withdrawing."
         )
+    # Identity verification gates payouts only once the platform turns it on.
+    # Defaulting this off matters: switching KYC on shouldn't strand people who
+    # are already owed money and haven't been asked to verify yet.
+    if config().get("require_kyc_for_payout"):
+        kyc = getattr(user, "kyc", None)
+        if not (kyc and kyc.is_verified):
+            raise WithdrawalError(
+                "Your identity needs to be verified before you can withdraw. "
+                "Complete the verification section in your profile."
+            )
 
     amount = _money(amount_usd)
     if amount <= ZERO:
