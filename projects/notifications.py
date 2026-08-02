@@ -71,7 +71,7 @@ def notify_quote_sent(project):
         paragraphs=[
             f"Hi {project.client.full_name or 'there'},",
             f"We've scoped “{project.title}” and prepared a fixed quote of {_money(project.quote_usd)}.",
-            "Review the details and pay securely with Paystack to get the build started.",
+            "Review the details and pay securely with Paystack to get the work started.",
         ],
         cta=("Review quote & pay", _project_url(project)),
     )
@@ -85,7 +85,7 @@ def notify_payment_received(project):
         heading="Payment received — thank you!",
         paragraphs=[
             f"We've received your payment for “{project.title}”.",
-            "A developer will be assigned and work begins shortly. Your funds are held securely and only "
+            "An expert will be assigned and work begins shortly. Your funds are held securely and only "
             "released to the talent once you approve the delivered work.",
         ],
         cta=("Track your project", _project_url(project)),
@@ -94,17 +94,17 @@ def notify_payment_received(project):
         subject=f"Paid & ready to assign: {project.title}",
         to=_lead_emails(),
         heading="A project is paid and ready to assign",
-        paragraphs=[f"“{project.title}” ({project.company}) has been paid. Assign a developer to kick it off."],
-        cta=("Assign a developer", _project_url(project)),
+        paragraphs=[f"“{project.title}” ({project.company}) has been paid. Assign an expert to kick it off."],
+        cta=("Assign an expert", _project_url(project)),
     )
 
 
 @_safe
 def notify_project_edited(project, summary, repriced=False):
-    """Tell the client (and the assigned developer) that the lead changed something."""
+    """Tell the client (and the assigned expert) that the lead changed something."""
     recipients = {project.client.email}
-    if project.developer:
-        recipients.add(project.developer.email)
+    if project.expert:
+        recipients.add(project.expert.email)
     paragraphs = [f"The delivery team updated “{project.title}”:", summary]
     if repriced:
         paragraphs.append(
@@ -121,26 +121,26 @@ def notify_project_edited(project, summary, repriced=False):
 
 
 @_safe
-def notify_developer_assigned(project):
-    if project.developer:
+def notify_expert_assigned(project):
+    if project.expert:
         send_brand_email(
             subject=f"You've been assigned: {project.title}",
-            to=project.developer.email,
+            to=project.expert.email,
             heading="You've got a new project",
             paragraphs=[
-                f"Hi {project.developer.full_name or 'there'},",
+                f"Hi {project.expert.full_name or 'there'},",
                 f"You've been assigned to build “{project.title}” for {project.company}.",
                 "Open your task board to see the breakdown, check off tasks, and post progress updates.",
             ],
             cta=("Open my tasks", f"{_frontend()}/tasks"),
         )
-    dev_name = project.developer.full_name if project.developer else "a developer"
+    expert_name = project.expert.full_name if project.expert else "an expert"
     send_brand_email(
         subject=f"Work has started on {project.title}",
         to=project.client.email,
-        heading="Your build is underway",
+        heading="Your project is underway",
         paragraphs=[
-            f"Good news — {dev_name} has been assigned to “{project.title}” and development has begun.",
+            f"Good news — {expert_name} has been assigned to “{project.title}” and work has begun.",
             "You'll get updates as milestones are hit, and you can follow progress live any time.",
         ],
         cta=("Follow progress", _project_url(project)),
@@ -152,8 +152,8 @@ def notify_update_posted(project, activity):
     """Notify everyone involved (except the author) when a progress update is posted."""
     author_email = activity.author.email if activity.author else None
     recipients = {project.client.email}
-    if project.developer:
-        recipients.add(project.developer.email)
+    if project.expert:
+        recipients.add(project.expert.email)
     recipients.update(_lead_emails())
     recipients.discard(author_email)
     kind_label = activity.get_kind_display()
@@ -209,8 +209,8 @@ def notify_project_completed(project, completed_by_client=True):
     should never find a project completed without hearing why.
     """
     recipients = set(_lead_emails())
-    if project.developer:
-        recipients.add(project.developer.email)
+    if project.expert:
+        recipients.add(project.expert.email)
     who = (f"{_client_name(project)} approved delivery of"
            if completed_by_client else
            "The delivery team marked")
@@ -236,4 +236,34 @@ def notify_project_completed(project, completed_by_client=True):
                 "it straight up.",
             ],
             cta=("View the project", _project_url(project)),
+        )
+
+
+def notify_attribution_changed(project, previous, current):
+    """Tell a business developer they gained (or lost) credit for a project.
+
+    Their commission depends on this, so neither change is silent.
+    """
+    if current:
+        send_brand_email(
+            subject=f"You're credited on {project.title}",
+            to=current.email,
+            heading="A project was credited to you",
+            paragraphs=[
+                f"Hi {current.full_name or 'there'},",
+                f"“{project.title}” ({project.company}) is now attributed to you. "
+                "Your commission is credited when the client approves delivery.",
+            ],
+            cta=("View the project", _project_url(project)),
+        )
+    if previous:
+        send_brand_email(
+            subject=f"Attribution changed on {project.title}",
+            to=previous.email,
+            heading="A project is no longer attributed to you",
+            paragraphs=[
+                f"Hi {previous.full_name or 'there'},",
+                f"“{project.title}” ({project.company}) is no longer credited to you. "
+                "If that looks wrong, reply to this email and we'll take a look.",
+            ],
         )

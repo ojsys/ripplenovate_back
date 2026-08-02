@@ -1,6 +1,7 @@
 import uuid
 
 from django.contrib.auth import get_user_model
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.exceptions import PermissionDenied
@@ -8,18 +9,32 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
 
+from catalog.models import ProductLine
+
 from .emails import (
+    notify_admins_of_application,
+    notify_lead_invitation_accepted,
+    send_application_received,
+    send_application_rejected,
+    send_business_dev_welcome,
     send_delivery_lead_welcome,
-    send_developer_welcome,
+    send_expert_invitation,
+    send_expert_welcome,
     send_password_reset_email,
     send_verification_email,
     send_welcome_client,
 )
-from .models import EmailToken, SiteSettings
+from .models import EmailToken, Invitation, PartnerProfile, SiteSettings
 from .serializers import (
+    ApprovalDecisionSerializer,
     ChangePasswordSerializer,
-    DeveloperCreateSerializer,
-    DeveloperUpdateSerializer,
+    ExpertCreateSerializer,
+    ExpertUpdateSerializer,
+    InvitationAcceptSerializer,
+    InvitationCreateSerializer,
+    InvitationSerializer,
+    OnboardingSerializer,
+    PartnerProfileSerializer,
     PasswordResetConfirmSerializer,
     ProfileUpdateSerializer,
     RegisterSerializer,
@@ -30,9 +45,18 @@ from .serializers import (
 User = get_user_model()
 
 
-def _require_lead(user):
+def _require_lead(user, approved=True):
+    """Gate an action to a delivery lead.
+
+    `approved=False` for the onboarding surface itself — a lead in review must
+    still be able to build their team, since that's part of what's reviewed.
+    """
     if user.role != User.Role.DELIVERY_LEAD and not user.is_superuser:
         raise PermissionDenied("Only a delivery lead can do that.")
+    if approved and not user.is_approved:
+        raise PermissionDenied(
+            "Your delivery lead account is still being reviewed."
+        )
 
 
 def tokens_for(user):
@@ -180,28 +204,59 @@ def change_password(request):
 
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
-def developers(request):
-    """List developer accounts, or (delivery lead) create a new one with a profile."""
+def experts(request):
+    """List expert accounts, or (delivery lead) create a new one with a profile.
+
+    Filters:
+      ``?mine=1``            only the experts on the caller's own roster
+      ``?product_line=slug`` only experts who work in that discipline
+
+    The assignment picker uses both: a lead staffs a brief from their own team,
+    in the discipline the brief belongs to — not from a global talent pool.
+    """
     if request.method == "POST":
         _require_lead(request.user)
-        serializer = DeveloperCreateSerializer(data=request.data)
+        serializer = ExpertCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        user = serializer.save()
-        send_developer_welcome(user)
+        # A lead-created expert joins that lead's roster.
+        user = serializer.save(lead=request.user)
+        slugs = request.data.get("product_lines") or []
+        # Default to the lead's own disciplines, so an expert is never created
+        # unassignable.
+        lines = (ProductLine.objects.filter(slug__in=slugs, is_active=True)
+                 if slugs else request.user.product_lines.all())
+        user.product_lines.set(lines)
+        send_expert_welcome(user)
         return Response(UserSerializer(user).data, status=status.HTTP_201_CREATED)
-    qs = User.objects.filter(role=User.Role.DEVELOPER).order_by("full_name")
+
+    qs = User.objects.filter(role=User.Role.EXPERT)
+    if request.query_params.get("mine") in ("1", "true"):
+        qs = qs.filter(lead=request.user)
+    line_slug = request.query_params.get("product_line")
+    if line_slug:
+        qs = qs.filter(product_lines__slug=line_slug)
+    qs = qs.prefetch_related("product_lines").distinct().order_by("full_name")
+    return Response(UserSerializer(qs, many=True).data)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def business_developers(request):
+    """The business developers a lead can credit a project to."""
+    _require_lead(request.user)
+    qs = User.objects.filter(role=User.Role.BUSINESS_DEV).order_by("full_name")
     return Response(UserSerializer(qs, many=True).data)
 
 
 @api_view(["PATCH"])
 @permission_classes([IsAuthenticated])
-def update_developer(request, user_id):
-    """Delivery lead edits a developer's profile (name, specialty, load)."""
+def update_expert(request, user_id):
+    """Delivery lead edits an expert's profile (name, specialty, load)."""
     _require_lead(request.user)
-    target = User.objects.filter(id=user_id, role=User.Role.DEVELOPER).first()
+    target = User.objects.filter(id=user_id, role=User.Role.EXPERT).first()
     if not target:
-        return Response({"detail": "Developer not found."}, status=status.HTTP_404_NOT_FOUND)
-    serializer = DeveloperUpdateSerializer(target, data=request.data, partial=True)
+        return Response({"detail": "Expert not found."}, status=status.HTTP_404_NOT_FOUND)
+    serializer = ExpertUpdateSerializer(target, data=request.data, partial=True)
     serializer.is_valid(raise_exception=True)
     serializer.save()
     return Response(UserSerializer(target).data)
@@ -228,6 +283,314 @@ def update_role(request, user_id):
     if target.role != previous_role:
         if target.role == User.Role.DELIVERY_LEAD:
             send_delivery_lead_welcome(target)
-        elif target.role == User.Role.DEVELOPER:
-            send_developer_welcome(target)
+        elif target.role == User.Role.EXPERT:
+            send_expert_welcome(target)
+        elif target.role == User.Role.BUSINESS_DEV:
+            # Issued before the email, which includes the referral link.
+            target.ensure_referral_code()
+            send_business_dev_welcome(target)
     return Response(UserSerializer(target).data)
+
+
+# ---------------------------------------------------------------------------
+# Partner onboarding — the resumable signup wizard for leads and business devs
+# ---------------------------------------------------------------------------
+
+@api_view(["GET", "PATCH"])
+@permission_classes([IsAuthenticated])
+def onboarding(request):
+    """Read or save the signed-in partner's onboarding progress.
+
+    PATCH saves whatever the current step supplied and moves the cursor. It is
+    deliberately partial and forgiving: the wizard writes on every step so a
+    closed tab never loses work, and completeness is checked at submission
+    instead.
+    """
+    user = request.user
+    if not user.needs_approval:
+        raise PermissionDenied("Onboarding is for delivery leads and business developers.")
+
+    profile, _ = PartnerProfile.objects.get_or_create(user=user)
+
+    if request.method == "PATCH":
+        serializer = OnboardingSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        for field in ("full_name", "company", "specialty"):
+            if field in data:
+                setattr(user, field, data[field])
+        if "skills" in data:
+            user.skills = data["skills"]
+        if "onboarding_step" in data:
+            # Only ever moves forward, so revisiting an earlier step to correct
+            # something doesn't reset how far they've actually got.
+            user.onboarding_step = max(user.onboarding_step, data["onboarding_step"])
+        user.save()
+
+        if "product_lines" in data:
+            user.product_lines.set(
+                ProductLine.objects.filter(
+                    slug__in=data["product_lines"], is_active=True
+                )
+            )
+        if "profile" in data:
+            for field, value in data["profile"].items():
+                setattr(profile, field, value)
+            profile.save()
+
+    return Response({
+        "user": UserSerializer(user).data,
+        "profile": PartnerProfileSerializer(profile).data,
+        "team_size": user.team_members.count(),
+        "pending_invitations": user.sent_invitations.filter(
+            status=Invitation.Status.PENDING).count(),
+        "has_payout_account": user.has_payout_account,
+    })
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def submit_application(request):
+    """Send a finished onboarding to the review queue."""
+    user = request.user
+    if not user.needs_approval:
+        raise PermissionDenied("Only delivery leads and business developers apply.")
+    if user.approval_status == User.ApprovalStatus.APPROVED:
+        return Response({"detail": "Your account is already approved."},
+                        status=status.HTTP_400_BAD_REQUEST)
+
+    profile = PartnerProfile.objects.filter(user=user).first()
+    missing = []
+    if not user.full_name.strip():
+        missing.append("your name")
+    if not (profile and profile.country.strip()):
+        missing.append("your country")
+    if not (profile and profile.past_delivery.strip()):
+        missing.append("what you've delivered before")
+    if user.role == User.Role.DELIVERY_LEAD and not user.product_lines.exists():
+        missing.append("at least one product line")
+    if missing:
+        return Response(
+            {"detail": "Before submitting, add " + _readable_list(missing) + ".",
+             "missing": missing},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    user.submit_application()
+    send_application_received(user)
+    notify_admins_of_application(user)
+    return Response(UserSerializer(user).data)
+
+
+def _readable_list(items):
+    if len(items) == 1:
+        return items[0]
+    return ", ".join(items[:-1]) + f" and {items[-1]}"
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def applications(request):
+    """The review queue — pending partner applications."""
+    if not request.user.is_superuser and request.user.role != User.Role.DELIVERY_LEAD:
+        raise PermissionDenied("Only an admin can review applications.")
+    qs = (User.objects
+          .filter(approval_status=User.ApprovalStatus.PENDING)
+          .select_related("partner_profile")
+          .prefetch_related("product_lines")
+          .order_by("applied_at"))
+    return Response([
+        {
+            **UserSerializer(user).data,
+            "profile": (PartnerProfileSerializer(user.partner_profile).data
+                        if hasattr(user, "partner_profile") else None),
+            "applied_at": user.applied_at,
+        }
+        for user in qs
+    ])
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def decide_application(request, user_id):
+    """Approve or reject a partner application."""
+    if not request.user.is_superuser:
+        raise PermissionDenied("Only an admin can approve applications.")
+    target = User.objects.filter(id=user_id).first()
+    if not target or not target.needs_approval:
+        return Response({"detail": "No such application."},
+                        status=status.HTTP_404_NOT_FOUND)
+
+    serializer = ApprovalDecisionSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    if serializer.validated_data["decision"] == "approve":
+        target.approve(by=request.user)
+        if target.role == User.Role.BUSINESS_DEV:
+            target.ensure_referral_code()
+            send_business_dev_welcome(target)
+        else:
+            send_delivery_lead_welcome(target)
+    else:
+        reason = serializer.validated_data.get("reason", "")
+        target.reject(reason=reason, by=request.user)
+        send_application_rejected(target, reason)
+    return Response(UserSerializer(target).data)
+
+
+# ---------------------------------------------------------------------------
+# Expert invitations — how a delivery lead builds their roster
+# ---------------------------------------------------------------------------
+
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def invitations(request):
+    """List the caller's invitations, or send a batch of them.
+
+    POST accepts either one object or a list, because building a team is
+    naturally a bulk action — a lead shouldn't fill the same form six times.
+    A lead still in review may invite: their team is part of what's reviewed.
+    """
+    _require_lead(request.user, approved=False)
+
+    if request.method == "POST":
+        payload = request.data if isinstance(request.data, list) else [request.data]
+        serializer = InvitationCreateSerializer(data=payload, many=True)
+        serializer.is_valid(raise_exception=True)
+
+        created, skipped = [], []
+        for entry in serializer.validated_data:
+            email = entry["email"]
+            if Invitation.objects.filter(
+                email__iexact=email, status=Invitation.Status.PENDING
+            ).exists():
+                skipped.append(email)
+                continue
+            invitation = Invitation.objects.create(
+                email=email,
+                full_name=entry.get("full_name", ""),
+                specialty=entry.get("specialty", ""),
+                skills=entry.get("skills", []),
+                invited_by=request.user,
+            )
+            slugs = entry.get("product_lines") or []
+            lines = (ProductLine.objects.filter(slug__in=slugs, is_active=True)
+                     if slugs else request.user.product_lines.all())
+            invitation.product_lines.set(lines)
+            send_expert_invitation(invitation)
+            created.append(invitation)
+
+        return Response(
+            {"created": InvitationSerializer(created, many=True).data,
+             "skipped": skipped},
+            status=status.HTTP_201_CREATED,
+        )
+
+    qs = (request.user.sent_invitations
+          .prefetch_related("product_lines")
+          .exclude(status=Invitation.Status.REVOKED))
+    return Response(InvitationSerializer(qs, many=True).data)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def revoke_invitation(request, invitation_id):
+    _require_lead(request.user, approved=False)
+    invitation = Invitation.objects.filter(
+        id=invitation_id, invited_by=request.user
+    ).first()
+    if not invitation:
+        return Response({"detail": "Invitation not found."},
+                        status=status.HTTP_404_NOT_FOUND)
+    if invitation.status == Invitation.Status.ACCEPTED:
+        return Response({"detail": "That invitation was already accepted."},
+                        status=status.HTTP_400_BAD_REQUEST)
+    invitation.status = Invitation.Status.REVOKED
+    invitation.save(update_fields=["status"])
+    return Response({"detail": "Invitation revoked."})
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def resend_invitation(request, invitation_id):
+    _require_lead(request.user, approved=False)
+    invitation = Invitation.objects.filter(
+        id=invitation_id, invited_by=request.user,
+        status=Invitation.Status.PENDING,
+    ).first()
+    if not invitation:
+        return Response({"detail": "No pending invitation to resend."},
+                        status=status.HTTP_404_NOT_FOUND)
+    # Resending renews the clock, otherwise a resent-but-expired link is a
+    # dead end that looks live.
+    invitation.expires_at = timezone.now() + Invitation.TTL
+    invitation.save(update_fields=["expires_at"])
+    send_expert_invitation(invitation)
+    return Response(InvitationSerializer(invitation).data)
+
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def invitation_detail(request, token):
+    """Public preview of an invitation, for the accept screen."""
+    invitation = (Invitation.objects
+                  .filter(token=token)
+                  .select_related("invited_by")
+                  .prefetch_related("product_lines")
+                  .first())
+    if not invitation:
+        return Response({"detail": "This invitation link isn't valid."},
+                        status=status.HTTP_404_NOT_FOUND)
+    if not invitation.is_open:
+        reason = ("This invitation has already been used."
+                  if invitation.status == Invitation.Status.ACCEPTED
+                  else "This invitation has expired or been withdrawn.")
+        return Response({"detail": reason}, status=status.HTTP_410_GONE)
+    return Response(InvitationSerializer(invitation).data)
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def accept_invitation(request, token):
+    """The invitee creates their account with a password they choose."""
+    invitation = (Invitation.objects
+                  .filter(token=token)
+                  .select_related("invited_by")
+                  .first())
+    if not invitation:
+        return Response({"detail": "This invitation link isn't valid."},
+                        status=status.HTTP_404_NOT_FOUND)
+    if not invitation.is_open:
+        return Response({"detail": "This invitation is no longer valid."},
+                        status=status.HTTP_410_GONE)
+    if User.objects.filter(email__iexact=invitation.email).exists():
+        return Response({"detail": "An account with this email already exists."},
+                        status=status.HTTP_400_BAD_REQUEST)
+
+    serializer = InvitationAcceptSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    data = serializer.validated_data
+
+    user = User.objects.create_user(
+        email=invitation.email,
+        password=data["password"],
+        full_name=data.get("full_name") or invitation.full_name,
+        specialty=data.get("specialty") or invitation.specialty,
+        skills=invitation.skills,
+        role=User.Role.EXPERT,
+        lead=invitation.invited_by,
+        # Accepting the invitation proves they own the address.
+        is_email_verified=True,
+    )
+    user.product_lines.set(invitation.product_lines.all())
+
+    invitation.status = Invitation.Status.ACCEPTED
+    invitation.accepted_at = timezone.now()
+    invitation.save(update_fields=["status", "accepted_at"])
+
+    notify_lead_invitation_accepted(invitation, user)
+    return Response(
+        {**tokens_for(user), "user": UserSerializer(user).data,
+         "detail": "Welcome aboard — your account is ready."},
+        status=status.HTTP_201_CREATED,
+    )

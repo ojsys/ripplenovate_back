@@ -93,14 +93,22 @@ def invoice(request, pk):
 
 
 def _require_earner(user):
+    if user.needs_approval and not user.is_approved:
+        raise PermissionDenied(
+            "Your account is still being reviewed — earnings unlock once it's approved."
+        )
     if not user.can_earn:
-        raise PermissionDenied("Earnings are for developers and delivery leads.")
+        raise PermissionDenied(
+            "Earnings are for experts, delivery leads and business developers."
+        )
 
 
 def _require_settler(user):
-    """Only a delivery lead / admin settles payout requests — never their own."""
+    """Only an approved delivery lead / admin settles payouts — never their own."""
     if user.role != user.Role.DELIVERY_LEAD and not user.is_superuser:
         raise PermissionDenied("Only a delivery lead can settle payout requests.")
+    if not user.is_approved:
+        raise PermissionDenied("Your delivery lead account is still being reviewed.")
 
 
 @api_view(["GET"])
@@ -205,7 +213,7 @@ def resolve_account(request):
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def create_withdrawal(request):
-    """A developer or delivery lead withdraws part of their available balance."""
+    """An expert or delivery lead withdraws part of their available balance."""
     _require_earner(request.user)
     serializer = WithdrawalCreateSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)

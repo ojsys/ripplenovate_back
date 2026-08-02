@@ -1,8 +1,9 @@
-"""Earnings + withdrawable balance for developers and delivery leads.
+"""Earnings + withdrawable balance for experts, delivery leads and business devs.
 
-A project's quote is split on approval: the assigned developer takes one share,
-the delivery lead who quoted it takes another, and the remainder stays with the
-platform. Shares are admin-editable in Site settings.
+A project's quote is split on approval: the assigned expert takes one share, the
+delivery lead who quoted it takes another, the business developer who sourced it
+takes a commission (only when one is attributed), and the remainder stays with
+the platform. Shares are admin-editable in Site settings.
 
 Money that hasn't been approved yet is never written to the ledger — it's
 projected live from active projects, so nothing is withdrawable until the client
@@ -38,16 +39,20 @@ def config():
 def share_percent(kind, cfg=None):
     """The site-wide default share for a role (before per-project overrides)."""
     cfg = cfg or config()
-    if kind == Earning.Kind.DEVELOPER:
-        return Decimal(cfg["developer_share_percent"])
+    if kind == Earning.Kind.EXPERT:
+        return Decimal(cfg["expert_share_percent"])
+    if kind == Earning.Kind.BUSINESS_DEV:
+        return Decimal(cfg["business_dev_share_percent"])
     return Decimal(cfg["delivery_lead_share_percent"])
 
 
 def project_share(project, kind):
     """(percent, amount) this project pays a role — honouring its overrides."""
     split = project.payout_split()
-    if kind == Earning.Kind.DEVELOPER:
-        return split["developer_percent"], split["developer_usd"]
+    if kind == Earning.Kind.EXPERT:
+        return split["expert_percent"], split["expert_usd"]
+    if kind == Earning.Kind.BUSINESS_DEV:
+        return split["business_dev_percent"], split["business_dev_usd"]
     return split["delivery_lead_percent"], split["delivery_lead_usd"]
 
 
@@ -58,10 +63,12 @@ def share_amount(quote_usd, percent):
 def _earners(project):
     """(user, kind) pairs that a project pays out to, skipping unfilled roles."""
     pairs = []
-    if project.developer_id:
-        pairs.append((project.developer_id, Earning.Kind.DEVELOPER))
+    if project.expert_id:
+        pairs.append((project.expert_id, Earning.Kind.EXPERT))
     if project.lead_id:
         pairs.append((project.lead_id, Earning.Kind.DELIVERY_LEAD))
+    if project.business_developer_id:
+        pairs.append((project.business_developer_id, Earning.Kind.BUSINESS_DEV))
     return pairs
 
 
@@ -94,7 +101,8 @@ def record_project_earnings(project):
 def backfill(user):
     """Make sure every completed project this user earned on has a ledger row."""
     completed = Project.objects.filter(
-        Q(developer=user) | Q(lead=user), stage=Project.Stage.COMPLETED
+        Q(expert=user) | Q(lead=user) | Q(business_developer=user),
+        stage=Project.Stage.COMPLETED
     ).distinct()
     for project in completed:
         record_project_earnings(project)
@@ -103,16 +111,19 @@ def backfill(user):
 def _projected(user):
     """Not-yet-earned value from the user's paid-but-unapproved projects."""
     active = Project.objects.filter(
-        Q(developer=user) | Q(lead=user), stage__in=PENDING_STAGES
+        Q(expert=user) | Q(lead=user) | Q(business_developer=user),
+        stage__in=PENDING_STAGES
     ).distinct()
     total = ZERO
     for project in active:
         split = project.payout_split()
-        # A lead can also be the assigned developer; both shares count.
-        if project.developer_id == user.id:
-            total += split["developer_usd"]
+        # One person can hold more than one role on a project; each counts.
+        if project.expert_id == user.id:
+            total += split["expert_usd"]
         if project.lead_id == user.id:
             total += split["delivery_lead_usd"]
+        if project.business_developer_id == user.id:
+            total += split["business_dev_usd"]
     return _money(total)
 
 
@@ -127,10 +138,11 @@ def has_custom_splits(user):
     differently, saying a flat "you earn X%" would be wrong.
     """
     return Project.objects.filter(
-        Q(developer=user) | Q(lead=user)
+        Q(expert=user) | Q(lead=user) | Q(business_developer=user)
     ).filter(
-        Q(developer_share_percent__isnull=False)
+        Q(expert_share_percent__isnull=False)
         | Q(delivery_lead_share_percent__isnull=False)
+        | Q(business_dev_share_percent__isnull=False)
     ).exists()
 
 
@@ -151,8 +163,9 @@ def summary(user, refresh=True):
         "available_usd": max(available, ZERO),
         "pending_usd": _projected(user),
         "min_withdrawal_usd": _money(cfg["min_withdrawal_usd"]),
-        "developer_share_percent": Decimal(cfg["developer_share_percent"]),
+        "expert_share_percent": Decimal(cfg["expert_share_percent"]),
         "delivery_lead_share_percent": Decimal(cfg["delivery_lead_share_percent"]),
+        "business_dev_share_percent": Decimal(cfg["business_dev_share_percent"]),
     }
 
 
@@ -180,7 +193,10 @@ def request_withdrawal(user, amount_usd):
     from .paystack import charge_amount, usd_to_ngn_rate  # local import: avoids a cycle
 
     if not user.can_earn:
-        raise WithdrawalError("Only developers and delivery leads have earnings to withdraw.")
+        raise WithdrawalError(
+            "Only experts, delivery leads and business developers have earnings "
+            "to withdraw."
+        )
     if not user.has_payout_account:
         raise WithdrawalError(
             "Add your bank account in profile settings before withdrawing."

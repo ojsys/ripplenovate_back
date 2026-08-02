@@ -30,11 +30,11 @@
   <a class="rip-tile" href="{% url 'admin:projects_project_changelist' %}">
     <div class="rip-tile-num">{{ s.contracted_fmt }}</div><div class="rip-tile-lbl">Contracted value</div>
   </a>
-  <a class="rip-tile" href="{% url 'admin:projects_project_changelist' %}?stage__exact=Completed" title="Each delivered quote minus the developer and delivery-lead shares">
+  <a class="rip-tile" href="{% url 'admin:projects_project_changelist' %}?stage__exact=Completed" title="Each delivered quote minus the expert and delivery-lead shares">
     <div class="rip-tile-num green">{{ s.platform_fmt }}</div><div class="rip-tile-lbl">Platform share earned</div>
   </a>
-  <a class="rip-tile" href="{% url 'admin:accounts_user_changelist' %}?role__exact=developer">
-    <div class="rip-tile-num">{{ s.developers }}</div><div class="rip-tile-lbl">Developers</div>
+  <a class="rip-tile" href="{% url 'admin:accounts_user_changelist' %}?role__exact=expert">
+    <div class="rip-tile-num">{{ s.experts }}</div><div class="rip-tile-lbl">Experts</div>
   </a>
   <a class="rip-tile" href="{% url 'admin:accounts_user_changelist' %}?role__exact=client">
     <div class="rip-tile-num">{{ s.clients }}</div><div class="rip-tile-lbl">Clients</div>

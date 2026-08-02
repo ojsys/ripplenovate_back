@@ -1,10 +1,12 @@
 import random
 from decimal import ROUND_HALF_UP, Decimal
+from urllib.parse import urlparse
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
+from django.utils import timezone
 
 
 def _money(value):
@@ -44,13 +46,26 @@ class Project(models.Model):
         settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="client_projects"
     )
     company = models.CharField(max_length=150, blank=True)
+    # Which discipline delivers this brief, and the specific offering inside it.
+    # `product_line` is what routes the brief to the right delivery leads.
+    product_line = models.ForeignKey(
+        "catalog.ProductLine", on_delete=models.PROTECT,
+        null=True, blank=True, related_name="projects",
+    )
+    service = models.ForeignKey(
+        "catalog.Service", on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="projects",
+    )
+    # The service name at the time of posting. Kept as plain text so an invoice
+    # or a completed project still reads correctly if the catalogue is later
+    # renamed or reorganised.
     category = models.CharField(max_length=100)
     timeline = models.CharField(max_length=50, blank=True)
     budget_range = models.CharField(max_length=50, blank=True)
     description = models.TextField()
     stage = models.CharField(max_length=20, choices=Stage.choices, default=Stage.SUBMITTED)
     quote_usd = models.PositiveIntegerField(default=0)
-    developer = models.ForeignKey(
+    expert = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
         null=True, blank=True, related_name="assigned_projects",
     )
@@ -62,8 +77,8 @@ class Project(models.Model):
     # Per-project payout overrides. Null means "use the site default", so the
     # usual case stays in one place and only exceptional projects carry a number.
     SHARE_VALIDATORS = [MinValueValidator(Decimal("0")), MaxValueValidator(Decimal("100"))]
-    developer_share_percent = models.DecimalField(
-        "Developer share (%)", max_digits=5, decimal_places=2,
+    expert_share_percent = models.DecimalField(
+        "Expert share (%)", max_digits=5, decimal_places=2,
         null=True, blank=True, validators=SHARE_VALIDATORS,
         help_text="Leave blank to use the site default. Set a value to pay this "
                   "project differently — useful for a large or unusual build.",
@@ -72,10 +87,32 @@ class Project(models.Model):
         "Delivery lead share (%)", max_digits=5, decimal_places=2,
         null=True, blank=True, validators=SHARE_VALIDATORS,
         help_text="Leave blank to use the site default. The platform keeps "
-                  "whatever the developer and lead shares don't claim.",
+                  "whatever the expert and lead shares don't claim.",
     )
-    target_date = models.CharField(max_length=40, blank=True, default="TBD")
+    # The business developer who sourced this project. Set from the client's
+    # referral by default; a lead or admin can correct it until the client pays.
+    business_developer = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="sourced_projects",
+    )
+    business_dev_share_percent = models.DecimalField(
+        "Business developer commission (%)", max_digits=5, decimal_places=2,
+        null=True, blank=True, validators=SHARE_VALIDATORS,
+        help_text="Leave blank to use the site default. Only charged when a "
+                  "business developer is attributed to this project.",
+    )
+    # A real date, so "was it delivered on time?" is answerable. Null means the
+    # date hasn't been agreed yet — which is different from a date that's passed,
+    # and the two must never collapse into one another.
+    target_date = models.DateField(
+        "Target date", null=True, blank=True,
+        help_text="When delivery is promised. Leave blank until it's agreed.",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
+    # Stamped when the client (or a lead) approves delivery. Without it there is
+    # no honest way to measure how long a project actually took — `created_at`
+    # alone can't tell you when it finished.
+    completed_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["-created_at"]
@@ -95,35 +132,49 @@ class Project(models.Model):
         return self.stage in self.PAID_STAGES
 
     def clean(self):
-        dev = self.developer_share_percent
-        lead = self.delivery_lead_share_percent
-        if dev is not None and lead is not None and dev + lead > Decimal("100"):
+        # Only the overrides that are actually set constrain each other; a blank
+        # field follows the site default, which is validated in its own clean().
+        parts = [self.expert_share_percent, self.delivery_lead_share_percent,
+                 self.business_dev_share_percent]
+        total = sum((p for p in parts if p is not None), Decimal("0"))
+        if total > Decimal("100"):
             raise ValidationError(
-                "The developer and delivery lead shares can't add up to more than "
-                f"100% of the quote (currently {dev + lead}%)."
+                "The expert, delivery lead and business developer shares can't add "
+                f"up to more than 100% of the quote (currently {total}%)."
             )
 
     def payout_split(self):
-        """How this project's quote divides — developer, delivery lead, platform.
+        """How this project's quote divides — expert, lead, business dev, platform.
 
         A per-project override wins; anything left blank falls back to the site
         default. The platform's cut is the remainder, never a stored percentage,
-        so the three shares always total the quote exactly.
+        so the shares always total the quote exactly.
 
-        Once a project is approved the developer/lead figures come from the
-        credited Earning rows instead — those are snapshots of what was actually
-        paid, so changing an override later can't retroactively rewrite history
-        (or leave the platform's cut disagreeing with the ledger).
+        **The business developer commission is only charged when one is
+        attributed.** On a direct project their share is 0% and the platform
+        keeps it — which needs no special case, because the platform is the
+        remainder.
+
+        Once a project is approved the figures come from the credited Earning
+        rows instead — those are snapshots of what was actually paid, so
+        changing an override later can't retroactively rewrite history (or leave
+        the platform's cut disagreeing with the ledger).
         """
         from accounts.models import SiteSettings  # local: keeps app imports one-way
 
         cfg = SiteSettings.payout_config()
-        dev_pct = (self.developer_share_percent
-                   if self.developer_share_percent is not None
-                   else Decimal(cfg["developer_share_percent"]))
+        expert_pct = (self.expert_share_percent
+                      if self.expert_share_percent is not None
+                      else Decimal(cfg["expert_share_percent"]))
         lead_pct = (self.delivery_lead_share_percent
                     if self.delivery_lead_share_percent is not None
                     else Decimal(cfg["delivery_lead_share_percent"]))
+        if self.business_developer_id:
+            bizdev_pct = (self.business_dev_share_percent
+                          if self.business_dev_share_percent is not None
+                          else Decimal(cfg["business_dev_share_percent"]))
+        else:
+            bizdev_pct = Decimal("0")
         quote = _money(self.quote_usd)
 
         credited = {}
@@ -140,23 +191,77 @@ class Project(models.Model):
                 return _money(amount), credited_pct
             return _money(quote * pct / Decimal(100)), pct
 
-        dev_usd, dev_pct = part("developer", dev_pct)
+        expert_usd, expert_pct = part("expert", expert_pct)
         lead_usd, lead_pct = part("delivery_lead", lead_pct)
-        platform_usd = _money(quote - dev_usd - lead_usd)
+        bizdev_usd, bizdev_pct = part("business_dev", bizdev_pct)
+        platform_usd = _money(quote - expert_usd - lead_usd - bizdev_usd)
         return {
             "quote_usd": quote,
-            "developer_percent": dev_pct,
-            "developer_usd": dev_usd,
+            "expert_percent": expert_pct,
+            "expert_usd": expert_usd,
             "delivery_lead_percent": lead_pct,
             "delivery_lead_usd": lead_usd,
-            # Both derived from the other two, so the split always closes exactly
+            "business_dev_percent": bizdev_pct,
+            "business_dev_usd": bizdev_usd,
+            "has_business_dev": bool(self.business_developer_id),
+            # Both derived from the others, so the split always closes exactly
             # — including any rounding.
-            "platform_percent": _money(Decimal("100") - dev_pct - lead_pct),
+            "platform_percent": _money(Decimal("100") - expert_pct - lead_pct - bizdev_pct),
             "platform_usd": platform_usd,
-            "uses_override": (self.developer_share_percent is not None
-                              or self.delivery_lead_share_percent is not None),
+            "uses_override": (self.expert_share_percent is not None
+                              or self.delivery_lead_share_percent is not None
+                              or self.business_dev_share_percent is not None),
             "is_settled": bool(credited),
         }
+
+    @property
+    def cycle_days(self):
+        """Calendar days from brief to approval, or None if still running."""
+        if not self.completed_at:
+            return None
+        return max((self.completed_at - self.created_at).days, 0)
+
+    @property
+    def is_on_time(self):
+        """Was it delivered by the promised date?
+
+        None when the question doesn't apply — no target agreed, or not
+        delivered yet. Callers must treat None as "excluded from the sample",
+        never as a miss: a project with no promised date can't break a promise.
+        """
+        if not self.target_date or not self.completed_at:
+            return None
+        return self.completed_at.date() <= self.target_date
+
+    @property
+    def days_late(self):
+        """How far past the target it landed. Negative means early."""
+        if not self.target_date or not self.completed_at:
+            return None
+        return (self.completed_at.date() - self.target_date).days
+
+    @property
+    def is_overdue(self):
+        """Past its target and still not delivered.
+
+        False (not None) when there's no target, so the board can treat this as
+        a plain flag — an unagreed date is not an overdue one.
+        """
+        if not self.target_date or self.stage == self.Stage.COMPLETED:
+            return False
+        return timezone.localdate() > self.target_date
+
+    @property
+    def days_overdue(self):
+        """How many days past the target a live project is. None if it isn't.
+
+        Derived server-side alongside `is_overdue` rather than recomputed in the
+        browser, so the flag and the number are always answering from the same
+        clock.
+        """
+        if not self.is_overdue:
+            return None
+        return (timezone.localdate() - self.target_date).days
 
     @property
     def progress_pct(self):
@@ -216,3 +321,89 @@ class Activity(models.Model):
 
     def __str__(self):
         return f"{self.author_name}: {self.text[:40]}"
+
+
+class Attachment(models.Model):
+    """A link to something that lives outside the platform.
+
+    Design, research and content work isn't handed over as a checked-off task —
+    it's a Figma file, a deck, a document. Without somewhere to put those, a
+    non-software project has no way to actually deliver anything, and the
+    conversation drifts to email where nobody else can see it.
+
+    Deliberately links rather than uploads for now: it's how designers and
+    researchers already share work, and it needs no storage, no virus scanning
+    and no decision about where bytes live. File uploads can be added alongside
+    this later without changing how attachments are read.
+    """
+
+    class Kind(models.TextChoices):
+        FIGMA = "figma", "Figma"
+        DRIVE = "drive", "Google Drive"
+        DROPBOX = "dropbox", "Dropbox"
+        GITHUB = "github", "GitHub"
+        NOTION = "notion", "Notion"
+        LOOM = "loom", "Loom"
+        LINK = "link", "Link"
+
+    class Purpose(models.TextChoices):
+        # What the client supplied: brand assets, existing research, examples.
+        REFERENCE = "reference", "Reference"
+        # What the team produced: the actual work being handed over.
+        DELIVERABLE = "deliverable", "Deliverable"
+
+    # Host fragments that identify a link's source, longest-first so that a more
+    # specific match wins.
+    HOST_KINDS = [
+        ("figma.com", Kind.FIGMA),
+        ("drive.google.com", Kind.DRIVE),
+        ("docs.google.com", Kind.DRIVE),
+        ("dropbox.com", Kind.DROPBOX),
+        ("github.com", Kind.GITHUB),
+        ("notion.so", Kind.NOTION),
+        ("notion.site", Kind.NOTION),
+        ("loom.com", Kind.LOOM),
+    ]
+
+    project = models.ForeignKey(
+        Project, on_delete=models.CASCADE, related_name="attachments"
+    )
+    # Set when the link was shared as part of a progress update, so the feed can
+    # show it inline and the deliverables panel can say where it came from.
+    activity = models.ForeignKey(
+        Activity, on_delete=models.CASCADE,
+        null=True, blank=True, related_name="attachments",
+    )
+    url = models.URLField(max_length=1000)
+    label = models.CharField(max_length=200, blank=True)
+    kind = models.CharField(max_length=12, choices=Kind.choices, default=Kind.LINK)
+    purpose = models.CharField(
+        max_length=12, choices=Purpose.choices, default=Purpose.DELIVERABLE
+    )
+    added_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+
+    def __str__(self):
+        return f"{self.label or self.url} ({self.get_kind_display()})"
+
+    @classmethod
+    def detect_kind(cls, url):
+        """Work out what a link points at, so the UI can label and icon it."""
+        host = urlparse(url or "").netloc.lower()
+        for fragment, kind in cls.HOST_KINDS:
+            if host == fragment or host.endswith("." + fragment):
+                return kind
+        return cls.Kind.LINK
+
+    def save(self, *args, **kwargs):
+        if not self.kind or self.kind == self.Kind.LINK:
+            self.kind = self.detect_kind(self.url)
+        if not self.label:
+            # A bare host reads better in a list than a 200-character URL.
+            self.label = urlparse(self.url).netloc or self.url[:200]
+        super().save(*args, **kwargs)

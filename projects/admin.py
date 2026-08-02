@@ -2,7 +2,7 @@ from django.contrib import admin
 from django.utils.html import format_html, format_html_join
 from django.utils.safestring import mark_safe
 
-from .models import Activity, Project, Task
+from .models import Activity, Attachment, Project, Task
 
 
 def _usd(amount):
@@ -27,22 +27,32 @@ class ActivityInline(admin.TabularInline):
     readonly_fields = ("created_at",)
 
 
+class AttachmentInline(admin.TabularInline):
+    model = Attachment
+    extra = 0
+    fields = ("url", "label", "kind", "purpose", "added_by", "created_at")
+    readonly_fields = ("kind", "created_at")
+
+
 @admin.register(Project)
 class ProjectAdmin(admin.ModelAdmin):
     list_display = ("code", "title", "company", "category", "stage", "quote_usd",
-                    "payout_split_column", "developer", "lead", "created_at")
-    list_filter = ("stage", "category")
+                    "payout_split_column", "expert", "lead", "target_date",
+                    "delivery_flag", "created_at")
+    list_filter = ("stage", "category", "product_line")
     search_fields = ("code", "title", "company", "client__full_name", "client__email")
-    autocomplete_fields = ("client", "developer", "lead")
+    autocomplete_fields = ("client", "expert", "lead", "business_developer")
     readonly_fields = ("code", "created_at", "payout_breakdown")
     date_hierarchy = "created_at"
-    inlines = [TaskInline, ActivityInline]
+    inlines = [TaskInline, AttachmentInline, ActivityInline]
     fieldsets = (
         (None, {"fields": ("code", "title", "client", "company", "category")}),
         ("Brief", {"fields": ("description", "timeline", "budget_range", "target_date")}),
-        ("Delivery", {"fields": ("stage", "quote_usd", "developer", "lead")}),
+        ("Delivery", {"fields": ("stage", "quote_usd", "expert", "lead",
+                                 "business_developer")}),
         ("Payout split", {
-            "fields": ("payout_breakdown", "developer_share_percent",
+            "fields": ("payout_breakdown", "expert_share_percent",
+                       "business_dev_share_percent",
                        "delivery_lead_share_percent"),
             "description": "How this project's quote is divided. Both percentages are "
                            "optional — leave them blank to follow the site defaults in "
@@ -56,13 +66,27 @@ class ProjectAdmin(admin.ModelAdmin):
         # payout_split() reads credited earnings for delivered projects.
         return super().get_queryset(request).prefetch_related("earnings")
 
-    @admin.display(description="Split dev/lead/platform")
+    @admin.display(description="Delivery")
+    def delivery_flag(self, obj):
+        """On time / late / overdue at a glance, with no date treated as a miss."""
+        if obj.is_on_time is True:
+            return format_html('<span style="color:#0B7D61">On time</span>')
+        if obj.is_on_time is False:
+            return format_html(
+                '<span style="color:#C2410C">{} day{} late</span>',
+                obj.days_late, "" if obj.days_late == 1 else "s")
+        if obj.is_overdue:
+            return format_html('<span style="color:#C2410C;font-weight:600">Overdue</span>')
+        return "—"
+
+    @admin.display(description="Split expert/lead/BD/platform")
     def payout_split_column(self, obj):
         """At-a-glance split, so the platform's cut is visible from the list."""
         split = obj.payout_split()
-        label = "{}/{}/{}".format(
-            _pct(split["developer_percent"]),
+        label = "{}/{}/{}/{}".format(
+            _pct(split["expert_percent"]),
             _pct(split["delivery_lead_percent"]),
+            _pct(split["business_dev_percent"]),
             _pct(split["platform_percent"]),
         )
         if split["uses_override"]:
@@ -73,9 +97,9 @@ class ProjectAdmin(admin.ModelAdmin):
 
     @admin.display(description="Where the quote goes")
     def payout_breakdown(self, obj):
-        """The full split — developer, delivery lead, and the platform's remainder.
+        """The full split — expert, lead, business developer, and the remainder.
 
-        On an unsettled project the figures recalculate as you type the two
+        On an unsettled project the figures recalculate as you type the
         percentages, so the platform's share is visible before you save.
         """
         if obj is None or not obj.pk:
@@ -83,10 +107,14 @@ class ProjectAdmin(admin.ModelAdmin):
         split = obj.payout_split()
 
         rows = [
-            ("developer", "Developer", split["developer_percent"], split["developer_usd"],
-             obj.developer.full_name if obj.developer else "unassigned"),
+            ("expert", "Expert", split["expert_percent"], split["expert_usd"],
+             obj.expert.full_name if obj.expert else "unassigned"),
             ("lead", "Delivery lead", split["delivery_lead_percent"], split["delivery_lead_usd"],
              obj.lead.full_name if obj.lead else "unassigned"),
+            ("bizdev", "Business developer", split["business_dev_percent"],
+             split["business_dev_usd"],
+             obj.business_developer.full_name if obj.business_developer
+             else "none — the platform keeps this"),
             ("platform", "Platform", split["platform_percent"], split["platform_usd"],
              "Ripple Innovation Labs"),
         ]
@@ -108,9 +136,12 @@ class ProjectAdmin(admin.ModelAdmin):
             note = ("No quote yet — the amounts fill in once this project is quoted. The "
                     "percentages below still apply when it is.")
         else:
-            note = ("Projected — credited when the client approves delivery. Change either "
+            note = ("Projected — credited when the client approves delivery. Change a "
                     "percentage below and this updates as you type; the platform keeps "
-                    "whatever the two don't claim.")
+                    "whatever the others don't claim.")
+            if not split["has_business_dev"]:
+                note += (" No business developer is attributed, so the commission stays "
+                         "with the platform.")
         if split["uses_override"]:
             note += " This project overrides the site defaults."
 
@@ -119,10 +150,11 @@ class ProjectAdmin(admin.ModelAdmin):
             'font-size:11px;letter-spacing:.05em;white-space:nowrap">{}</th>'
         )
         table = format_html(
-            '<table data-ril-payout data-quote="{}" style="border-collapse:collapse;'
+            '<table data-ril-payout data-quote="{}" data-has-bd="{}" style="border-collapse:collapse;'
             'margin-bottom:8px"><tr>' + head + head + head + head + '</tr>{}</table>'
             '<div style="color:#8B93A0;font-size:12.5px;max-width:620px">{}</div>',
-            split["quote_usd"], "SHARE", "%",
+            split["quote_usd"], "1" if split["has_business_dev"] else "",
+            "SHARE", "%",
             format_html("OF {}", _usd(split["quote_usd"])), "WHO", body, note,
         )
         if split["is_settled"]:
@@ -147,10 +179,14 @@ class ProjectAdmin(admin.ModelAdmin):
   ready(function () {
   var table = document.querySelector('table[data-ril-payout]');
   if (!table) return;
-  var devIn = document.getElementById('id_developer_share_percent');
+  var expertIn = document.getElementById('id_expert_share_percent');
   var leadIn = document.getElementById('id_delivery_lead_share_percent');
+  var bdIn = document.getElementById('id_business_dev_share_percent');
   var quoteIn = document.getElementById('id_quote_usd');
-  if (!devIn || !leadIn) return;
+  // A commission only applies when a business developer is attributed; without
+  // one the platform keeps it, so the row stays at zero however it's edited.
+  var hasBd = table.dataset.hasBd === '1';
+  if (!expertIn || !leadIn) return;
 
   // Falls back to the site default (the value already rendered) when a field is
   // left blank, which is exactly what the server will do on save.
@@ -159,8 +195,9 @@ class ProjectAdmin(admin.ModelAdmin):
     return row && row.querySelector('td[data-cell="' + kind + '"]');
   };
   var defaults = {
-    developer: parseFloat(cell('developer', 'pct').textContent),
-    lead: parseFloat(cell('lead', 'pct').textContent)
+    expert: parseFloat(cell('expert', 'pct').textContent),
+    lead: parseFloat(cell('lead', 'pct').textContent),
+    bizdev: parseFloat(cell('bizdev', 'pct').textContent)
   };
   var usd = function (n) {
     return '$' + n.toFixed(2).replace(/\\B(?=(\\d{3})+(?!\\d))/g, ',');
@@ -172,11 +209,13 @@ class ProjectAdmin(admin.ModelAdmin):
 
   var update = function () {
     var quote = quoteIn ? (parseFloat(quoteIn.value) || 0) : parseFloat(table.dataset.quote) || 0;
-    var dev = num(devIn, defaults.developer);
+    var expert = num(expertIn, defaults.expert);
     var lead = num(leadIn, defaults.lead);
-    var platform = 100 - dev - lead;
+    var bizdev = hasBd ? num(bdIn, defaults.bizdev) : 0;
+    var platform = 100 - expert - lead - bizdev;
     var over = platform < 0;
-    [['developer', dev], ['lead', lead], ['platform', platform]].forEach(function (pair) {
+    [['expert', expert], ['lead', lead], ['bizdev', bizdev],
+     ['platform', platform]].forEach(function (pair) {
       var pct = pair[1];
       cell(pair[0], 'pct').textContent = pct.toFixed(2) + '%';
       cell(pair[0], 'usd').textContent = usd(quote * pct / 100);
@@ -187,7 +226,7 @@ class ProjectAdmin(admin.ModelAdmin):
       platform.toFixed(2) + '%' + (over ? ' — over 100%, this won\\'t save' : '');
   };
 
-  [devIn, leadIn, quoteIn].forEach(function (el) {
+  [expertIn, leadIn, bdIn, quoteIn].forEach(function (el) {
     if (el) el.addEventListener('input', update);
   });
   });

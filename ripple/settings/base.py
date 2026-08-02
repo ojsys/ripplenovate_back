@@ -48,7 +48,9 @@ INSTALLED_APPS = [
     # third-party
     "rest_framework",
     "corsheaders",
-    # local
+    # local — `catalog` first: it owns the product-line taxonomy that accounts
+    # and projects both point at, so the app dependency stays one-way.
+    "catalog",
     "accounts",
     "projects",
     "payments",

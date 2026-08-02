@@ -34,7 +34,10 @@ class Payment(models.Model):
 
 
 class Earning(models.Model):
-    """A realized share of a delivered project, credited to a developer or lead.
+    """A realized share of a delivered project.
+
+    Credited to the assigned expert, the delivery lead who quoted it, and the
+    business developer who sourced it (when there is one).
 
     One row per (project, earner, role). Rows are only written once the client
     approves delivery, so the sum of a user's earnings is money actually earned —
@@ -42,8 +45,9 @@ class Earning(models.Model):
     """
 
     class Kind(models.TextChoices):
-        DEVELOPER = "developer", "Developer share"
+        EXPERT = "expert", "Expert share"
         DELIVERY_LEAD = "delivery_lead", "Delivery lead share"
+        BUSINESS_DEV = "business_dev", "Business developer commission"
 
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="earnings"
