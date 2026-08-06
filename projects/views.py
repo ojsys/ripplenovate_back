@@ -1,8 +1,14 @@
 import logging
 
+from pathlib import Path
+
 from django.contrib.auth import get_user_model
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db.models import Q
+from django.http import FileResponse, Http404
 from django.utils import timezone
+
+from accounts.uploads import validate_project_document
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.exceptions import PermissionDenied, ValidationError
@@ -300,6 +306,47 @@ class ProjectViewSet(mixins.ListModelMixin,
         notifications.notify_attribution_changed(project, previous, new_bd)
         return self._detail(project)
 
+    @action(detail=True, methods=["post"], url_path="documents")
+    def documents(self, request, pk=None):
+        """Upload a document to the project.
+
+        Open to the client, the assigned expert and the delivery lead — all
+        three have something to hand over. Purpose follows the role for the same
+        reason a link's does: a client supplies references, the delivery team
+        supplies deliverables, so nobody can misstate who produced the work.
+        """
+        project = self.get_object()
+        user = request.user
+        is_client = user.role == Role.CLIENT and project.client_id == user.id
+        is_team = (self._is_lead()
+                   or (user.role == Role.EXPERT and project.expert_id == user.id))
+        if not (is_client or is_team):
+            raise PermissionDenied("You can't add documents to this project.")
+
+        upload = request.FILES.get("file")
+        if not upload:
+            raise ValidationError("Choose a file to upload.")
+        try:
+            validate_project_document(upload)
+        except DjangoValidationError as exc:
+            raise ValidationError(" ".join(exc.messages))
+
+        purpose = (Attachment.Purpose.REFERENCE if is_client
+                   else request.data.get("purpose") or Attachment.Purpose.DELIVERABLE)
+        attachment = Attachment.objects.create(
+            project=project,
+            file=upload,
+            original_filename=upload.name[:255],
+            size_bytes=upload.size,
+            label=(request.data.get("label") or "").strip()[:200],
+            purpose=purpose,
+            added_by=user,
+        )
+        if purpose == Attachment.Purpose.DELIVERABLE:
+            log_activity(project, user, f"Added a deliverable — {attachment.label}.")
+        return Response(AttachmentSerializer(attachment).data,
+                        status=status.HTTP_201_CREATED)
+
     @action(detail=True, methods=["post"])
     def assign(self, request, pk=None):
         project = self.get_object()
@@ -592,6 +639,45 @@ def pipeline(request):
     })
 
 
+def _on_project(user, project):
+    """Everyone attached to a project may read its documents.
+
+    The client who commissioned it, the expert delivering it, the lead running
+    it, and admins. Nobody else — a brief can contain anything from budgets to
+    unreleased plans.
+    """
+    if user.is_superuser or user.role == Role.DELIVERY_LEAD:
+        return True
+    return user.id in (project.client_id, project.expert_id, project.lead_id,
+                       project.business_developer_id)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def download_attachment(request, attachment_id):
+    """Stream an uploaded project document to someone on the project."""
+    attachment = (Attachment.objects
+                  .select_related("project")
+                  .filter(id=attachment_id)
+                  .first())
+    if not attachment or not attachment.file:
+        raise Http404
+    if not _on_project(request.user, attachment.project):
+        raise PermissionDenied("You can't view this document.")
+
+    try:
+        stream = attachment.file.open("rb")
+    except (FileNotFoundError, OSError):
+        raise Http404
+
+    response = FileResponse(
+        stream, as_attachment=True,
+        filename=attachment.original_filename or Path(attachment.file.name).name,
+    )
+    response["Cache-Control"] = "no-store, private"
+    return response
+
+
 @api_view(["DELETE"])
 @permission_classes([IsAuthenticated])
 def delete_attachment(request, attachment_id):
@@ -611,7 +697,11 @@ def delete_attachment(request, attachment_id):
     user = request.user
     is_lead = user.role == Role.DELIVERY_LEAD or user.is_superuser
     if not (attachment.added_by_id == user.id or is_lead):
-        raise PermissionDenied("You can't remove this link.")
+        raise PermissionDenied("You can't remove this attachment.")
+    # Drop the bytes as well as the row — otherwise deleted uploads sit on disk
+    # forever, which for a client's confidential brief is worse than untidy.
+    if attachment.file:
+        attachment.file.delete(save=False)
     attachment.delete()
     return Response(status=status.HTTP_204_NO_CONTENT)
 

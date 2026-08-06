@@ -13,6 +13,15 @@ from django.core.exceptions import ValidationError
 
 CV_EXTENSIONS = {".pdf", ".doc", ".docx", ".odt", ".rtf"}
 ID_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png", ".heic"}
+# Project documents: briefs, specs, designs, spreadsheets, decks, images, and
+# archives of the above. Deliberately no executables or scripts.
+PROJECT_EXTENSIONS = {
+    ".pdf", ".doc", ".docx", ".odt", ".rtf", ".txt", ".md",
+    ".xls", ".xlsx", ".ods", ".csv",
+    ".ppt", ".pptx", ".odp", ".key",
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic", ".svg",
+    ".zip", ".ai", ".psd", ".sketch", ".fig",
+}
 
 
 def _validate(upload, allowed, label):
@@ -35,8 +44,16 @@ def validate_id_document(upload):
     _validate(upload, ID_EXTENSIONS, "An ID document")
 
 
+def validate_project_document(upload):
+    _validate(upload, PROJECT_EXTENSIONS, "A document")
+
+
 def _path(folder, filename):
     return f"{folder}/{uuid.uuid4().hex}{Path(filename).suffix.lower()}"
+
+
+def project_document_path(instance, filename):
+    return _path("projects", filename)
 
 
 def cv_path(instance, filename):

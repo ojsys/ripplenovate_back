@@ -8,6 +8,8 @@ from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 from django.utils import timezone
 
+from accounts.uploads import project_document_path, validate_project_document
+
 
 def _money(value):
     return Decimal(value or 0).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
@@ -331,10 +333,13 @@ class Attachment(models.Model):
     non-software project has no way to actually deliver anything, and the
     conversation drifts to email where nobody else can see it.
 
-    Deliberately links rather than uploads for now: it's how designers and
-    researchers already share work, and it needs no storage, no virus scanning
-    and no decision about where bytes live. File uploads can be added alongside
-    this later without changing how attachments are read.
+    An attachment is **either a link or an uploaded file** — the same row type
+    either way, so everything that reads attachments (the deliverables panel, the
+    activity feed, the brief) handles both without knowing the difference.
+
+    Links came first because that's how designers already share work. Uploads
+    matter for the other half: a client attaching a scoping document or a
+    signed brief has a file, not a Figma URL.
     """
 
     class Kind(models.TextChoices):
@@ -345,6 +350,7 @@ class Attachment(models.Model):
         NOTION = "notion", "Notion"
         LOOM = "loom", "Loom"
         LINK = "link", "Link"
+        FILE = "file", "Uploaded file"
 
     class Purpose(models.TextChoices):
         # What the client supplied: brand assets, existing research, examples.
@@ -374,7 +380,16 @@ class Attachment(models.Model):
         Activity, on_delete=models.CASCADE,
         null=True, blank=True, related_name="attachments",
     )
-    url = models.URLField(max_length=1000)
+    # Exactly one of these carries the content. `url` for a link, `file` for an
+    # upload; `clean()` enforces that one and only one is set.
+    url = models.URLField(max_length=1000, blank=True)
+    file = models.FileField(
+        upload_to=project_document_path, blank=True, null=True,
+        validators=[validate_project_document],
+        help_text="Streamed through an authenticated view — never a public URL.",
+    )
+    original_filename = models.CharField(max_length=255, blank=True)
+    size_bytes = models.PositiveIntegerField(null=True, blank=True)
     label = models.CharField(max_length=200, blank=True)
     kind = models.CharField(max_length=12, choices=Kind.choices, default=Kind.LINK)
     purpose = models.CharField(
@@ -391,6 +406,16 @@ class Attachment(models.Model):
     def __str__(self):
         return f"{self.label or self.url} ({self.get_kind_display()})"
 
+    @property
+    def is_file(self):
+        return bool(self.file)
+
+    def clean(self):
+        if bool(self.url) == bool(self.file):
+            raise ValidationError(
+                "An attachment is either a link or an uploaded file — set one, not both."
+            )
+
     @classmethod
     def detect_kind(cls, url):
         """Work out what a link points at, so the UI can label and icon it."""
@@ -401,9 +426,14 @@ class Attachment(models.Model):
         return cls.Kind.LINK
 
     def save(self, *args, **kwargs):
-        if not self.kind or self.kind == self.Kind.LINK:
-            self.kind = self.detect_kind(self.url)
-        if not self.label:
-            # A bare host reads better in a list than a 200-character URL.
-            self.label = urlparse(self.url).netloc or self.url[:200]
+        if self.file:
+            self.kind = self.Kind.FILE
+            if not self.label:
+                self.label = self.original_filename or "Document"
+        else:
+            if not self.kind or self.kind == self.Kind.LINK:
+                self.kind = self.detect_kind(self.url)
+            if not self.label:
+                # A bare host reads better in a list than a 200-character URL.
+                self.label = urlparse(self.url).netloc or self.url[:200]
         super().save(*args, **kwargs)

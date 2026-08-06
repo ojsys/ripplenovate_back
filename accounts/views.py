@@ -374,8 +374,14 @@ def submit_application(request):
     if not user.needs_approval:
         raise PermissionDenied("Only delivery leads and business developers apply.")
     if user.approval_status == User.ApprovalStatus.APPROVED:
-        return Response({"detail": "Your account is already approved."},
-                        status=status.HTTP_400_BAD_REQUEST)
+        # Being approved before you submit is a legitimate path — an admin can
+        # do it directly. Treat the submit as "finish onboarding" rather than an
+        # error, so nobody is told off for completing a form they were asked to
+        # complete.
+        if not user.onboarding_completed_at:
+            user.onboarding_completed_at = timezone.now()
+            user.save(update_fields=["onboarding_completed_at"])
+        return Response(UserSerializer(user).data)
 
     profile = ProfessionalProfile.objects.filter(user=user).first()
     missing = []

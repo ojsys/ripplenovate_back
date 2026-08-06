@@ -92,7 +92,24 @@ def invoice(request, pk):
     })
 
 
+def _require_earner_role(user):
+    """Someone whose role earns — regardless of whether they're approved yet.
+
+    Setting up *where* you would be paid is part of onboarding, and a partner
+    fills it in while their application is still under review. Gating this on
+    approval left the payout step of the wizard showing a spinner forever, so
+    people skipped past it and arrived with no bank account on file.
+    """
+    if user.role not in (user.Role.EXPERT, user.Role.DELIVERY_LEAD,
+                         user.Role.BUSINESS_DEV):
+        raise PermissionDenied(
+            "Payout accounts are for experts, delivery leads and business developers."
+        )
+
+
 def _require_earner(user):
+    """Someone who may actually see or draw money. Approval matters here."""
+    _require_earner_role(user)
     if user.needs_approval and not user.is_approved:
         raise PermissionDenied(
             "Your account is still being reviewed — earnings unlock once it's approved."
@@ -158,7 +175,7 @@ def _account_payload(user):
 @permission_classes([IsAuthenticated])
 def payout_account(request):
     """The signed-in earner's own bank account — read and update, nobody else's."""
-    _require_earner(request.user)
+    _require_earner_role(request.user)
     if request.method == "PUT":
         serializer = PayoutAccountSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -186,7 +203,7 @@ def payout_account(request):
 @permission_classes([IsAuthenticated])
 def payout_banks(request):
     """Banks Paystack can pay into, for the account picker."""
-    _require_earner(request.user)
+    _require_earner_role(request.user)
     try:
         return Response({"banks": transfers.list_banks()})
     except paystack.PaystackError as exc:
@@ -197,7 +214,7 @@ def payout_banks(request):
 @permission_classes([IsAuthenticated])
 def resolve_account(request):
     """Confirm an account number really belongs to the name on it."""
-    _require_earner(request.user)
+    _require_earner_role(request.user)
     serializer = ResolveAccountSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
     try:

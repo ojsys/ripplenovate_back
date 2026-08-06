@@ -27,12 +27,15 @@ class TaskSerializer(serializers.ModelSerializer):
 
 class AttachmentSerializer(serializers.ModelSerializer):
     added_by_name = serializers.SerializerMethodField()
+    is_file = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = Attachment
         fields = ["id", "url", "label", "kind", "purpose", "created_at",
-                  "added_by", "added_by_name"]
-        read_only_fields = ["kind", "added_by", "created_at"]
+                  "added_by", "added_by_name", "is_file", "original_filename",
+                  "size_bytes"]
+        read_only_fields = ["kind", "added_by", "created_at", "is_file",
+                            "original_filename", "size_bytes"]
 
     def get_added_by_name(self, obj):
         if not obj.added_by:

@@ -226,8 +226,15 @@ class User(AbstractUser):
         self.approved_at = timezone.now()
         self.approved_by = by
         self.rejection_reason = ""
-        self.save(update_fields=["approval_status", "approved_at", "approved_by",
-                                 "rejection_reason"])
+        fields = ["approval_status", "approved_at", "approved_by", "rejection_reason"]
+        # An admin can approve someone who never submitted through the wizard —
+        # from the Django admin, or ahead of them finishing. Leaving onboarding
+        # "incomplete" then traps an approved person in the signup flow, so
+        # approval closes it out.
+        if not self.onboarding_completed_at:
+            self.onboarding_completed_at = timezone.now()
+            fields.append("onboarding_completed_at")
+        self.save(update_fields=fields)
 
     def reject(self, reason="", by=None):
         self.approval_status = self.ApprovalStatus.REJECTED

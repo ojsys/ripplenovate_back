@@ -12,5 +12,6 @@ urlpatterns = [
     path("reports", views.reports),
     path("tasks/<int:task_id>/toggle", views.toggle_task),
     path("attachments/<int:attachment_id>", views.delete_attachment),
+    path("attachments/<int:attachment_id>/download", views.download_attachment),
     *router.urls,
 ]
