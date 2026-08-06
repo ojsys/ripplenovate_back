@@ -17,7 +17,16 @@ Role = User.Role
 
 
 def visible_projects(user):
-    """The projects a delivery lead's board covers — their lines, plus their own.
+    """The projects a delivery lead's board covers.
+
+    Work they lead, plus briefs nobody has claimed yet in the disciplines they
+    run. That second clause is the intake queue and nothing more: `lead` is
+    unset until someone quotes, so without it a new brief would be invisible to
+    every lead on the platform and could never be picked up at all.
+
+    The moment a lead quotes a brief they own it, and it leaves everyone else's
+    board — running the same discipline as someone is not a reason to see their
+    client's budget.
 
     Mirrors ProjectViewSet.get_queryset so the stat tiles can never disagree
     with the table underneath them.
@@ -26,16 +35,18 @@ def visible_projects(user):
     if user.is_superuser:
         return base
     lines = user.product_lines.values_list("id", flat=True)
-    return base.filter(Q(product_line__in=lines) | Q(lead=user)).distinct()
+    return base.filter(
+        Q(lead=user) | (Q(lead__isnull=True) & Q(product_line__in=lines))
+    ).distinct()
 
 
 def can_access_project(user, project):
     """Whether this person is attached to this project at all.
 
     The client who commissioned it, the expert delivering it, the lead running
-    it, the business developer credited with it, and admins. A delivery lead
-    also covers every brief in the disciplines they run — the same scope their
-    board shows them, and no wider. Nobody else: a brief can contain anything
+    it, the business developer credited with it, and admins — plus a lead
+    looking at an unclaimed brief in one of their own disciplines, which is the
+    only way one ever gets quoted. Nobody else: a brief can contain anything
     from budgets to unreleased plans.
     """
     if user.is_superuser:
@@ -44,6 +55,7 @@ def can_access_project(user, project):
                    project.business_developer_id):
         return True
     return (user.role == Role.DELIVERY_LEAD
+            and project.lead_id is None
             and project.product_line_id is not None
             and user.product_lines.filter(id=project.product_line_id).exists())
 

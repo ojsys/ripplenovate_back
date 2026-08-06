@@ -136,13 +136,15 @@ class ProjectViewSet(mixins.ListModelMixin,
         if user.is_superuser:
             return base
         if user.role == Role.DELIVERY_LEAD:
-            # A lead sees the briefs in the disciplines they run, plus anything
-            # they already lead — never the whole platform. Without the second
-            # clause a lead would lose sight of a project the moment they (or an
-            # admin) changed which lines they cover.
+            # Work they lead, plus unclaimed briefs in the disciplines they run
+            # — the intake queue, which is the only way a brief ever gets
+            # quoted. Once someone quotes it they own it and it leaves every
+            # other lead's board. Keeping `lead=user` unconditional also means a
+            # lead never loses sight of a project because an admin changed which
+            # lines they cover.
             lines = user.product_lines.values_list("id", flat=True)
             return base.filter(
-                Q(product_line__in=lines) | Q(lead=user)
+                Q(lead=user) | (Q(lead__isnull=True) & Q(product_line__in=lines))
             ).distinct()
         if user.role == Role.EXPERT:
             return base.filter(expert=user)

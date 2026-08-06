@@ -36,8 +36,8 @@ class ProjectScopeTests(TestCase):
         self.lead = User.objects.create_user(
             "owner@ril.team", "x", role=User.Role.DELIVERY_LEAD)
         self.lead.product_lines.add(self.line)
-        # Runs the same discipline but isn't on this brief: still in scope, the
-        # way their board already shows it to them.
+        # Runs the same discipline, but this brief is somebody else's: out of
+        # scope. Sharing a discipline is not a claim on another lead's client.
         self.peer_lead = User.objects.create_user(
             "peer@ril.team", "x", role=User.Role.DELIVERY_LEAD)
         self.peer_lead.product_lines.add(self.line)
@@ -132,10 +132,31 @@ class ProjectScopeTests(TestCase):
             self.assertEqual(self.invoice(outsider).status_code, 403)
             self.assertEqual(self.detail(outsider).status_code, 404)
 
+    def test_another_lead_in_the_same_discipline_is_shut_out_too(self):
+        """The stricter half. Running the same discipline as someone is not a
+        claim on their client's brief — once a lead has quoted it, it's theirs
+        and it leaves every other board."""
+        self.assertEqual(self.detail(self.peer_lead).status_code, 404)
+        self.assertEqual(self.download(self.peer_lead).status_code, 403)
+        self.assertEqual(self.toggle(self.peer_lead).status_code, 403)
+        self.assertEqual(self.delete_link(self.peer_lead).status_code, 403)
+        self.assertEqual(self.invoice(self.peer_lead).status_code, 403)
+        self.assertEqual(
+            as_user(self.peer_lead).post(
+                f"/api/projects/{self.project.id}/activity",
+                {"text": "Butting in", "kind": "note"}, format="json").status_code,
+            404)
+        self.assertEqual(
+            as_user(self.peer_lead).patch(
+                f"/api/projects/{self.project.id}/edit",
+                {"title": "Renamed"}, format="json").status_code,
+            404)
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.title, "Confidential rebrand")
+
     # --- and the people who should get through still do ---
     def test_the_delivery_team_and_client_keep_their_access(self):
-        for insider in (self.lead, self.peer_lead, self.admin, self.expert,
-                        self.customer):
+        for insider in (self.lead, self.admin, self.expert, self.customer):
             self.assertEqual(self.download(insider).status_code, 200,
                              f"{insider.email} lost document access")
             self.assertEqual(self.invoice(insider).status_code, 200,
@@ -144,8 +165,8 @@ class ProjectScopeTests(TestCase):
     def test_the_business_developer_can_still_read_the_documents(self):
         self.assertEqual(self.download(self.bizdev).status_code, 200)
 
-    def test_the_leads_who_run_the_line_can_still_work_the_project(self):
-        for insider in (self.lead, self.peer_lead, self.admin, self.expert):
+    def test_the_lead_who_runs_it_can_still_work_the_project(self):
+        for insider in (self.lead, self.admin, self.expert):
             self.assertEqual(self.toggle(insider).status_code, 200,
                              f"{insider.email} lost task access")
             self.assertEqual(self.delete_link(insider).status_code, 204,
@@ -173,8 +194,15 @@ class ProjectScopeTests(TestCase):
         signup nobody had reviewed could hand work to a client, sign it off on
         their behalf, and release the earnings that follow — all on a board they
         were only ever meant to be watching."""
+        # On a project of their own, so it's the approval gate under test here
+        # and not the scoping one — those are checked separately above.
+        own = Project.objects.create(
+            title="Their own brief", client=self.customer, category="Brand identity",
+            description="…", product_line=self.line, lead=self.pending_lead,
+            expert=self.expert, stage=Project.Stage.IN_PROGRESS, quote_usd=1000)
         client = as_user(self.pending_lead)
-        base = f"/api/projects/{self.project.id}"
+        base = f"/api/projects/{own.id}"
+        self.assertEqual(client.get(base).status_code, 200, "should still see it")
 
         self.assertEqual(client.post(f"{base}/submit-review").status_code, 403)
         self.assertEqual(client.post(f"{base}/remind-review").status_code, 403)
@@ -184,11 +212,11 @@ class ProjectScopeTests(TestCase):
             403)
 
         # And the one that moves money: approval credits every share.
-        self.project.stage = Project.Stage.REVIEW
-        self.project.save(update_fields=["stage"])
+        own.stage = Project.Stage.REVIEW
+        own.save(update_fields=["stage"])
         self.assertEqual(client.post(f"{base}/approve").status_code, 403)
-        self.project.refresh_from_db()
-        self.assertEqual(self.project.stage, Project.Stage.REVIEW)
+        own.refresh_from_db()
+        self.assertEqual(own.stage, Project.Stage.REVIEW)
 
     def test_an_approved_lead_still_runs_their_own_board(self):
         """The other half: approval gates the actions, it doesn't remove them."""
@@ -199,6 +227,56 @@ class ProjectScopeTests(TestCase):
         self.assertEqual(client.post(f"{base}/approve").status_code, 200)
         self.project.refresh_from_db()
         self.assertEqual(self.project.stage, Project.Stage.COMPLETED)
+
+    def unclaimed(self):
+        """A fresh brief nobody has quoted — `lead` is unset until someone does."""
+        return Project.objects.create(
+            title="Unclaimed brief", client=self.customer, category="Brand identity",
+            description="…", product_line=self.line, stage=Project.Stage.SUBMITTED)
+
+    def test_an_unquoted_brief_reaches_every_lead_who_runs_that_line(self):
+        """The intake queue. `lead` is only set when someone quotes, so scoping
+        strictly to `lead=user` would hide new briefs from everyone and nothing
+        could ever be picked up."""
+        brief = self.unclaimed()
+        for lead in (self.lead, self.peer_lead):
+            codes = {p["code"] for p in as_user(lead).get("/api/projects").data}
+            self.assertIn(brief.code, codes, lead.email)
+            self.assertEqual(
+                as_user(lead).get(f"/api/projects/{brief.id}").status_code, 200)
+
+    def test_quoting_claims_the_brief_and_clears_it_from_other_boards(self):
+        """The handover the whole rule turns on."""
+        brief = self.unclaimed()
+        response = as_user(self.peer_lead).post(
+            f"/api/projects/{brief.id}/quote", {"quote_usd": 1500}, format="json")
+        self.assertEqual(response.status_code, 200)
+        brief.refresh_from_db()
+        self.assertEqual(brief.lead_id, self.peer_lead.id)
+
+        # It's the quoting lead's now — and nobody else's, same discipline or not.
+        codes = {p["code"] for p in as_user(self.lead).get("/api/projects").data}
+        self.assertNotIn(brief.code, codes)
+        self.assertEqual(
+            as_user(self.lead).get(f"/api/projects/{brief.id}").status_code, 404)
+        self.assertEqual(
+            as_user(self.peer_lead).get(f"/api/projects/{brief.id}").status_code, 200)
+
+    def test_an_unquoted_brief_stays_within_its_own_discipline(self):
+        brief = self.unclaimed()
+        self.assertEqual(
+            as_user(self.foreign_lead).get(f"/api/projects/{brief.id}").status_code, 404)
+
+    def test_the_board_stats_agree_with_the_board(self):
+        """`visible_projects` feeds the stat tiles; if it drifts from the
+        queryset the numbers describe projects the lead can't open."""
+        self.unclaimed()
+        for lead in (self.lead, self.peer_lead):
+            listed = {p["id"] for p in as_user(lead).get("/api/projects").data}
+            stats = as_user(lead).get("/api/projects/stats/admin").data
+            active = {p for p in listed
+                      if Project.objects.get(id=p).stage != Project.Stage.COMPLETED}
+            self.assertEqual(stats["active_total"], len(active), lead.email)
 
     def test_a_project_with_no_product_line_stays_private_to_its_own_team(self):
         """No line means no discipline to inherit access from — only the people
