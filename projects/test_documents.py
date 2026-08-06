@@ -57,6 +57,43 @@ class ProjectDocumentTests(TestCase):
         # A client supplies references, never deliverables.
         self.assertEqual(response.data["purpose"], "reference")
 
+    def test_a_client_can_hand_over_a_brief_either_way(self):
+        """A brief arrives as a file as often as it arrives as a Drive link, and
+        it can occur to a client after they've submitted. Both routes stay open
+        on a live project, and both are filed as references."""
+        uploaded = self.upload(self.customer, name="Scope.docx")
+        linked = as_user(self.customer).post(
+            f"/api/projects/{self.project.id}/attachments",
+            {"url": "https://docs.google.com/document/d/1", "label": "The brief"},
+            format="json")
+
+        self.assertEqual(uploaded.status_code, 201)
+        self.assertEqual(linked.status_code, 201)
+        self.assertEqual(
+            {a["purpose"] for a in (uploaded.data, linked.data)}, {"reference"})
+        self.assertEqual(
+            {a["kind"] for a in (uploaded.data, linked.data)}, {"file", "drive"})
+
+        # Both show up on the brief, for the client and the delivery team alike.
+        for viewer in (self.customer, self.lead, self.expert):
+            detail = as_user(viewer).get(f"/api/projects/{self.project.id}").data
+            refs = [a for a in detail["attachments"] if a["purpose"] == "reference"]
+            self.assertEqual(len(refs), 2, viewer.email)
+
+    def test_a_client_can_add_a_reference_at_any_stage(self):
+        """Including after payment and once the work is in review — a missing
+        asset is exactly the thing that surfaces late."""
+        for stage in (Project.Stage.SUBMITTED, Project.Stage.QUOTED,
+                      Project.Stage.PAID, Project.Stage.REVIEW,
+                      Project.Stage.COMPLETED):
+            self.project.stage = stage
+            self.project.save(update_fields=["stage"])
+            self.assertEqual(self.upload(self.customer).status_code, 201, stage)
+            response = as_user(self.customer).post(
+                f"/api/projects/{self.project.id}/attachments",
+                {"url": f"https://example.com/{stage}"}, format="json")
+            self.assertEqual(response.status_code, 201, stage)
+
     def test_the_expert_and_lead_can_upload_deliverables(self):
         for user in (self.expert, self.lead):
             response = self.upload(user)

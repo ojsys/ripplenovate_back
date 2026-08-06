@@ -16,6 +16,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from . import notifications
+from .access import can_access_project, leads_project, visible_projects
 from .models import Activity, Attachment, Project, Task
 from .serializers import (
     ActivityCreateSerializer,
@@ -388,8 +389,17 @@ class ProjectViewSet(mixins.ListModelMixin,
         return self._detail(project)
 
     def _is_lead(self):
+        """A lead cleared to act on this project.
+
+        `get_object()` has already scoped the project to this user, so what's
+        left to check is approval — the same bar `_require_lead` sets. Without
+        it a self-serve signup nobody has reviewed could hand work to a client,
+        sign it off, and release the earnings that follow.
+        """
         user = self.request.user
-        return user.role == Role.DELIVERY_LEAD or user.is_superuser
+        if user.role != Role.DELIVERY_LEAD and not user.is_superuser:
+            return False
+        return user.is_approved
 
     @action(detail=True, methods=["post"], url_path="submit-review")
     def submit_review(self, request, pk=None):
@@ -517,9 +527,11 @@ def toggle_task(request, task_id):
         return Response({"detail": "Task not found."}, status=status.HTTP_404_NOT_FOUND)
     project = task.project
     user = request.user
+    # Scoped by the project, not by the role: `role == DELIVERY_LEAD` is true
+    # for every lead on the platform, so it let any of them tick off tasks on
+    # work they have nothing to do with.
     allowed = (
-        user.is_superuser
-        or user.role == Role.DELIVERY_LEAD
+        leads_project(user, project)
         or (user.role == Role.EXPERT and project.expert_id == user.id)
     )
     if not allowed:
@@ -527,19 +539,6 @@ def toggle_task(request, task_id):
     task.done = not task.done
     task.save(update_fields=["done"])
     return Response(TaskSerializer(task).data)
-
-
-def visible_projects(user):
-    """The projects a delivery lead's board covers — their lines, plus their own.
-
-    Mirrors ProjectViewSet.get_queryset so the stat tiles can never disagree
-    with the table underneath them.
-    """
-    base = Project.objects.all()
-    if user.is_superuser:
-        return base
-    lines = user.product_lines.values_list("id", flat=True)
-    return base.filter(Q(product_line__in=lines) | Q(lead=user)).distinct()
 
 
 @api_view(["GET"])
@@ -639,19 +638,6 @@ def pipeline(request):
     })
 
 
-def _on_project(user, project):
-    """Everyone attached to a project may read its documents.
-
-    The client who commissioned it, the expert delivering it, the lead running
-    it, and admins. Nobody else — a brief can contain anything from budgets to
-    unreleased plans.
-    """
-    if user.is_superuser or user.role == Role.DELIVERY_LEAD:
-        return True
-    return user.id in (project.client_id, project.expert_id, project.lead_id,
-                       project.business_developer_id)
-
-
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def download_attachment(request, attachment_id):
@@ -662,7 +648,7 @@ def download_attachment(request, attachment_id):
                   .first())
     if not attachment or not attachment.file:
         raise Http404
-    if not _on_project(request.user, attachment.project):
+    if not can_access_project(request.user, attachment.project):
         raise PermissionDenied("You can't view this document.")
 
     try:
@@ -695,8 +681,8 @@ def delete_attachment(request, attachment_id):
         return Response({"detail": "Link not found."}, status=status.HTTP_404_NOT_FOUND)
 
     user = request.user
-    is_lead = user.role == Role.DELIVERY_LEAD or user.is_superuser
-    if not (attachment.added_by_id == user.id or is_lead):
+    if not (attachment.added_by_id == user.id
+            or leads_project(user, attachment.project)):
         raise PermissionDenied("You can't remove this attachment.")
     # Drop the bytes as well as the row — otherwise deleted uploads sit on disk
     # forever, which for a client's confidential brief is worse than untidy.

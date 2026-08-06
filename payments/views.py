@@ -11,6 +11,7 @@ from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+from projects.access import can_access_project
 from projects.models import Project
 
 from . import earnings as earnings_service
@@ -69,7 +70,10 @@ def invoice(request, pk):
     project = Project.objects.filter(pk=pk).first()
     if not project:
         return Response({"detail": "Project not found."}, status=status.HTTP_404_NOT_FOUND)
-    if project.client_id != request.user.id and request.user.role != request.user.Role.DELIVERY_LEAD:
+    # Scoped to the project. The old check passed any delivery lead, which is
+    # every lead on the platform — and the quote, the fee and the client are
+    # nobody else's business.
+    if not can_access_project(request.user, project):
         raise PermissionDenied("Not your invoice.")
     breakdown = paystack.quote_breakdown(project)
     currency, amount_subunit = paystack.charge_amount(breakdown["total_usd"])
