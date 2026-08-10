@@ -531,23 +531,54 @@ def invitations(request):
     POST accepts either one object or a list, because building a team is
     naturally a bulk action — a lead shouldn't fill the same form six times.
     A lead still in review may invite: their team is part of what's reviewed.
+
+    "Invite" means *get this person onto my team*. Where they already have an
+    expert account there's nothing to invite them to — an invitation creates an
+    account — so they simply join the roster instead. Someone who worked with
+    another lead, or with this one previously, comes back the same way. The
+    response says which of the three happened to each address.
     """
     _require_lead(request.user, approved=False)
 
     if request.method == "POST":
         payload = request.data if isinstance(request.data, list) else [request.data]
-        serializer = InvitationCreateSerializer(
-            data=payload, many=True, context={"lead_id": request.user.id})
+        serializer = InvitationCreateSerializer(data=payload, many=True)
         serializer.is_valid(raise_exception=True)
 
-        created, skipped = [], []
+        created, added, skipped = [], [], []
         for entry in serializer.validated_data:
             email = entry["email"]
+
+            # Already has an expert account: bring them onto the team rather
+            # than sending an invitation they could never accept.
+            existing = User.objects.filter(
+                email__iexact=email, role=User.Role.EXPERT).first()
+            if existing:
+                if existing.lead_id == request.user.id:
+                    skipped.append(
+                        {"email": email, "reason": "already on your team"})
+                    continue
+                previous = existing.lead
+                existing.lead = request.user
+                existing.save(update_fields=["lead"])
+                # Without a shared discipline they'd be unassignable, so they
+                # pick up their new lead's lines on top of their own.
+                slugs = entry.get("product_lines") or []
+                lines = (ProductLine.objects.filter(slug__in=slugs, is_active=True)
+                         if slugs else request.user.product_lines.all())
+                existing.product_lines.add(*lines)
+                notify_roster_changed(existing, new_lead=request.user,
+                                      previous_lead=previous)
+                added.append(existing)
+                continue
+
             if Invitation.objects.filter(
                 email__iexact=email, status=Invitation.Status.PENDING
             ).exists():
-                skipped.append(email)
+                skipped.append(
+                    {"email": email, "reason": "already invited and waiting"})
                 continue
+
             invitation = Invitation.objects.create(
                 email=email,
                 full_name=entry.get("full_name", ""),
@@ -564,6 +595,8 @@ def invitations(request):
 
         return Response(
             {"created": InvitationSerializer(created, many=True).data,
+             "added": UserSerializer(added, many=True,
+                                     context={"viewer": request.user}).data,
              "skipped": skipped},
             status=status.HTTP_201_CREATED,
         )

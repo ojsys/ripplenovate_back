@@ -232,42 +232,27 @@ class InvitationCreateSerializer(serializers.Serializer):
     product_lines = serializers.ListField(child=serializers.SlugField(), required=False)
 
     def validate_email(self, value):
-        """An invitation creates an account, so it can't target one that exists.
+        """Only refuse what genuinely can't be done.
 
-        The message says which case it is and what to do instead. "Someone with
-        this email already has an account" is true but leads nowhere — a lead
-        reading it can't tell whether the person is already theirs to assign,
-        works for another lead, or isn't an expert at all, and the natural
-        conclusion is that inviting again is the only way through.
+        An existing *expert* is fine — the view puts them on the caller's team
+        instead of sending an invitation, which is what the lead wanted anyway.
+        Inviting someone is "get this person onto my team"; whether that needs
+        a new account is an implementation detail they shouldn't have to know,
+        and making it their problem sent them looking for an admin.
+
+        A client or a business developer is a different matter: an invitation
+        can't turn one into an expert, and quietly reassigning somebody's role
+        from a text box is not something this should do.
         """
         value = value.lower().strip()
         existing = User.objects.filter(email__iexact=value).first()
-        if not existing:
-            return value
-
-        who = existing.full_name or value
-        if existing.role != User.Role.EXPERT:
+        if existing and existing.role != User.Role.EXPERT:
             raise serializers.ValidationError(
-                f"{who} already has an account here as a "
-                f"{existing.get_role_display().lower()}, so they can't be invited "
-                "as an expert. An admin can change their role if that's wrong."
+                f"{existing.full_name or value} already has an account here as a "
+                f"{existing.get_role_display().lower()}. An admin can change their "
+                "role to expert if that's what you meant."
             )
-        lead = existing.lead
-        if lead_id := self.context.get("lead_id"):
-            if lead and lead.id == lead_id:
-                raise serializers.ValidationError(
-                    f"{who} is already on your team — no invitation needed. "
-                    "Add them straight to a project from the assign screen."
-                )
-        if lead:
-            raise serializers.ValidationError(
-                f"{who} is already an expert on {lead.full_name or lead.email}'s "
-                "team. Ask an admin to move them across."
-            )
-        raise serializers.ValidationError(
-            f"{who} already has an expert account but isn't on anyone's team. "
-            "Ask an admin to add them to your roster."
-        )
+        return value
 
 
 class InvitationAcceptSerializer(serializers.Serializer):
