@@ -61,6 +61,8 @@ def ensure_credited(projects):
     """
     from payments import earnings as earnings_service
 
+    from .models import Task
+
     uncredited = (
         projects
         .filter(stage=Stage.COMPLETED, earnings__isnull=True)
@@ -69,6 +71,16 @@ def ensure_credited(projects):
     )
     for project in uncredited:
         earnings_service.record_project_earnings(project)
+
+    # Approved tasks credit on approval and are repaired lazily on the earnings
+    # page, for the same reason. Same argument applies: an approved-but-
+    # uncredited task is a cost the platform has committed to and the report
+    # would omit, flattering the margin until its expert happened to log in.
+    for task in Task.objects.filter(
+        project__in=projects, status=Task.Status.APPROVED,
+        amount_usd__gt=0, earnings__isnull=True,
+    ).select_related("project"):
+        earnings_service.record_task_earning(task)
 
 
 def product_lines(scope=None):
@@ -90,6 +102,7 @@ def product_lines(scope=None):
                 "delivered_count": 0, "delivered_value_usd": 0,
                 "expert_cost_usd": ZERO, "lead_cost_usd": ZERO,
                 "bizdev_cost_usd": ZERO, "platform_usd": ZERO,
+                "in_flight_paid_usd": ZERO,
                 "cycle_days": [], "on_time": [],
                 "leads": 0, "experts": 0,
             }
@@ -109,9 +122,13 @@ def product_lines(scope=None):
             row["active_value_usd"] += project.quote_usd
 
     # One grouped query for the whole ledger rather than a split per project.
+    # Delivered projects only: a task payout lands when the lead approves the
+    # task, which can be well before the client signs the project off, so
+    # counting those against a line whose income hasn't arrived yet would make
+    # its margin read far worse than it is.
     credited = (
         Earning.objects
-        .filter(project__in=projects)
+        .filter(project__in=projects, project__stage=Stage.COMPLETED)
         .values("project__product_line__slug", "kind")
         .annotate(total=Sum("amount_usd"))
     )
@@ -124,6 +141,20 @@ def product_lines(scope=None):
         key = entry["project__product_line__slug"] or "unassigned"
         if key in rows:
             rows[key][cost_field[entry["kind"]]] += _money(entry["total"])
+
+    # Cash out on work still running — the line's live exposure, kept apart
+    # from the delivered P&L rather than folded into it.
+    in_flight = (
+        Earning.objects
+        .filter(project__in=projects)
+        .exclude(project__stage=Stage.COMPLETED)
+        .values("project__product_line__slug")
+        .annotate(total=Sum("amount_usd"))
+    )
+    for entry in in_flight:
+        key = entry["project__product_line__slug"] or "unassigned"
+        if key in rows:
+            rows[key]["in_flight_paid_usd"] += _money(entry["total"])
 
     # Headcount per line, in two queries rather than one per row.
     members = (
@@ -154,7 +185,8 @@ def product_lines(scope=None):
         )
         row.pop("cycle_days")
         row.pop("on_time")
-        for key in ("expert_cost_usd", "lead_cost_usd", "bizdev_cost_usd", "platform_usd"):
+        for key in ("expert_cost_usd", "lead_cost_usd", "bizdev_cost_usd",
+                    "platform_usd", "in_flight_paid_usd"):
             row[key] = str(row[key])
         row["margin_percent"] = str(row["margin_percent"]) if row["margin_percent"] is not None else None
         out.append(row)
@@ -302,8 +334,20 @@ def totals(scope=None):
     active = projects.exclude(stage=Stage.COMPLETED)
 
     delivered_value = _money(delivered.aggregate(t=Sum("quote_usd"))["t"] or 0)
+    # Costs against delivered work only. Task payouts land as a lead approves
+    # each task, which can be long before the client signs the project off — so
+    # counting every earning here would subtract money spent on work whose value
+    # hasn't reached `delivered_value` yet, and understate the margin (to the
+    # point of going negative on a young, busy line).
     paid_out = _money(
-        Earning.objects.filter(project__in=projects)
+        Earning.objects.filter(project__in=delivered)
+        .aggregate(t=Sum("amount_usd"))["t"] or 0
+    )
+    # The other half of that story, reported rather than hidden: cash already
+    # released on projects still running. It is the platform's live exposure —
+    # if one of these were refunded, this is what has already gone out.
+    in_flight = _money(
+        Earning.objects.filter(project__in=active)
         .aggregate(t=Sum("amount_usd"))["t"] or 0
     )
     cycle = [p.cycle_days for p in delivered if p.cycle_days is not None]
@@ -316,6 +360,8 @@ def totals(scope=None):
         "active_count": active.count(),
         "active_value_usd": str(_money(active.aggregate(t=Sum("quote_usd"))["t"] or 0)),
         "paid_out_usd": str(paid_out),
+        # Released on work the client hasn't signed off yet.
+        "in_flight_paid_usd": str(in_flight),
         "platform_usd": str(_money(delivered_value - paid_out)),
         "margin_percent": (
             str(_money((delivered_value - paid_out) / delivered_value * 100))

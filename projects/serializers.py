@@ -15,14 +15,49 @@ def _initials(name):
 
 class TaskSerializer(serializers.ModelSerializer):
     assignee_name = serializers.SerializerMethodField()
+    # `done` is now a view of `status`, kept so existing boards keep reading the
+    # same field while the lifecycle grows underneath them.
+    done = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = Task
-        fields = ["id", "title", "done", "order", "assignee", "assignee_name"]
-        read_only_fields = ["assignee", "assignee_name"]
+        fields = ["id", "title", "description", "done", "status", "amount_usd",
+                  "order", "assignee", "assignee_name", "submitted_at",
+                  "approved_at"]
+        read_only_fields = ["assignee", "assignee_name", "status", "amount_usd",
+                            "submitted_at", "approved_at"]
 
     def get_assignee_name(self, obj):
         return obj.assignee.full_name if obj.assignee else ""
+
+
+class TaskWriteSerializer(serializers.ModelSerializer):
+    """A delivery lead creating or editing a task.
+
+    `status` is absent on purpose. It moves through the lifecycle actions —
+    submit, approve, request changes — which check who is asking and release
+    money on the way. A writable status field here would be a way to pay
+    someone with a PATCH.
+    """
+
+    class Meta:
+        model = Task
+        fields = ["title", "description", "assignee", "amount_usd", "order"]
+
+    def validate_title(self, value):
+        if not value.strip():
+            raise serializers.ValidationError("Give the task a title.")
+        return value.strip()
+
+    def validate_amount_usd(self, value):
+        if value < 0:
+            raise serializers.ValidationError("An amount can't be negative.")
+        return value
+
+    def validate_assignee(self, value):
+        if value and value.role != value.Role.EXPERT:
+            raise serializers.ValidationError("Tasks are assigned to experts.")
+        return value
 
 
 class AttachmentSerializer(serializers.ModelSerializer):
@@ -102,20 +137,60 @@ class ProjectListSerializer(serializers.ModelSerializer):
         return obj.expert.full_name if obj.expert else ""
 
 
+class TeamMemberSerializer(serializers.Serializer):
+    """One expert on a project's delivery team."""
+
+    id = serializers.IntegerField(read_only=True)
+    full_name = serializers.CharField(read_only=True)
+    email = serializers.EmailField(read_only=True)
+    specialty = serializers.CharField(read_only=True)
+    initials = serializers.SerializerMethodField()
+    is_primary = serializers.SerializerMethodField()
+
+    def get_initials(self, obj):
+        return _initials(obj.full_name or obj.email)
+
+    def get_is_primary(self, obj):
+        return obj.id == self.context.get("primary_expert_id")
+
+
 class ProjectDetailSerializer(ProjectListSerializer):
     client_name = serializers.SerializerMethodField()
     expert_role = serializers.SerializerMethodField()
     business_developer_name = serializers.SerializerMethodField()
+    team = serializers.SerializerMethodField()
     tasks = TaskSerializer(many=True, read_only=True)
     activity = ActivitySerializer(many=True, read_only=True)
     attachments = AttachmentSerializer(many=True, read_only=True)
+    # What the lead has to hand out, and what's left. The allocation meter is
+    # where they find out they've committed more than the project holds — it
+    # should say so before a save fails.
+    expert_pool_usd = serializers.DecimalField(
+        max_digits=12, decimal_places=2, read_only=True)
+    allocated_usd = serializers.DecimalField(
+        max_digits=12, decimal_places=2, read_only=True)
+    unallocated_usd = serializers.DecimalField(
+        max_digits=12, decimal_places=2, read_only=True)
+    uses_task_payouts = serializers.BooleanField(read_only=True)
 
     class Meta(ProjectListSerializer.Meta):
         fields = ProjectListSerializer.Meta.fields + [
             "client_name", "description", "timeline", "budget_range",
-            "expert_role", "tasks", "activity", "attachments",
+            "expert_role", "team", "tasks", "activity", "attachments",
             "business_developer", "business_developer_name",
+            "expert_pool_usd", "allocated_usd", "unallocated_usd",
+            "uses_task_payouts",
         ]
+
+    def get_team(self, obj):
+        # Ordered so the primary expert reads first, then by name.
+        members = sorted(
+            obj.experts.all(),
+            key=lambda u: (u.id != obj.expert_id, (u.full_name or u.email).lower()),
+        )
+        return TeamMemberSerializer(
+            members, many=True, context={"primary_expert_id": obj.expert_id}
+        ).data
         read_only_fields = ProjectListSerializer.Meta.read_only_fields + [
             "description", "timeline", "budget_range", "business_developer",
         ]
@@ -218,8 +293,33 @@ class QuoteSerializer(serializers.Serializer):
     quote_usd = serializers.IntegerField(min_value=1)
 
 
-class AssignSerializer(serializers.Serializer):
-    expert = serializers.IntegerField()
+class ExpertListSerializer(serializers.Serializer):
+    """One or more experts, however the caller chose to say it.
+
+    `expert` (singular) is the original shape and still what the assign screen
+    sends; `experts` is the list. Normalising both here means every caller
+    downstream sees the same thing, and the older clients keep working.
+    """
+
+    expert = serializers.IntegerField(required=False)
+    experts = serializers.ListField(
+        child=serializers.IntegerField(), required=False, default=list
+    )
+
+    def validate(self, attrs):
+        ids = list(attrs.get("experts") or [])
+        single = attrs.get("expert")
+        if single and single not in ids:
+            # First in the list is the primary, so a singular `expert` leads.
+            ids.insert(0, single)
+        if not ids:
+            raise serializers.ValidationError("Choose at least one expert.")
+        # Preserve order, drop repeats — the first mention wins.
+        attrs["expert_ids"] = list(dict.fromkeys(ids))
+        return attrs
+
+
+class AssignSerializer(ExpertListSerializer):
     tasks = serializers.ListField(
         child=serializers.CharField(allow_blank=True), required=False, default=list
     )

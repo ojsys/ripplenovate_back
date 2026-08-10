@@ -40,10 +40,25 @@ def visible_projects(user):
     ).distinct()
 
 
+def is_project_expert(user, project):
+    """Whether this person is on the project's delivery team.
+
+    Read through `experts.all()` rather than a filter, so a prefetched team —
+    the board, the detail view — is answered from cache instead of costing a
+    query per check. Teams are a handful of people; fetching one is cheap.
+
+    `expert` is checked too. It's always meant to be a member of `experts`, but
+    an admin can set it directly in the Django admin, and the primary expert
+    being locked out of their own project would be an odd way to find that out.
+    """
+    return (project.expert_id == user.id
+            or any(e.id == user.id for e in project.experts.all()))
+
+
 def can_access_project(user, project):
     """Whether this person is attached to this project at all.
 
-    The client who commissioned it, the expert delivering it, the lead running
+    The client who commissioned it, the experts delivering it, the lead running
     it, the business developer credited with it, and admins — plus a lead
     looking at an unclaimed brief in one of their own disciplines, which is the
     only way one ever gets quoted. Nobody else: a brief can contain anything
@@ -51,8 +66,10 @@ def can_access_project(user, project):
     """
     if user.is_superuser:
         return True
-    if user.id in (project.client_id, project.expert_id, project.lead_id,
+    if user.id in (project.client_id, project.lead_id,
                    project.business_developer_id):
+        return True
+    if is_project_expert(user, project):
         return True
     return (user.role == Role.DELIVERY_LEAD
             and project.lead_id is None

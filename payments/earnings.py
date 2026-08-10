@@ -17,7 +17,7 @@ from django.db.models import Q, Sum
 from django.utils import timezone
 
 from accounts.models import SiteSettings
-from projects.models import Project
+from projects.models import Project, Task
 
 from .models import Earning, Withdrawal
 
@@ -61,15 +61,57 @@ def share_amount(quote_usd, percent):
 
 
 def _earners(project):
-    """(user, kind) pairs that a project pays out to, skipping unfilled roles."""
+    """(user, kind) pairs a project pays at completion, skipping unfilled roles.
+
+    The expert share is here only when the project isn't paid per task. Once any
+    task carries a price, the experts have been paid task by task as the lead
+    approved them, and a completion-time row on top would pay the work twice.
+    """
     pairs = []
-    if project.expert_id:
+    if project.expert_id and not project.uses_task_payouts:
         pairs.append((project.expert_id, Earning.Kind.EXPERT))
     if project.lead_id:
         pairs.append((project.lead_id, Earning.Kind.DELIVERY_LEAD))
     if project.business_developer_id:
         pairs.append((project.business_developer_id, Earning.Kind.BUSINESS_DEV))
     return pairs
+
+
+def record_task_earning(task):
+    """Credit an expert for one approved task. Idempotent.
+
+    Returns the new Earning, or None when there was nothing to write — the task
+    isn't approved, carries no price, has nobody to pay, or has been credited
+    already. Callers treat None as "no money moved", never as failure.
+
+    The paid-project guard is the one that matters: the client settles the whole
+    quote before delivery starts, so a task payment always spends money already
+    banked. Crediting against an unpaid project would have the platform paying
+    out of its own pocket.
+    """
+    if task.status != Task.Status.APPROVED:
+        return None
+    if not task.assignee_id or task.amount_usd <= ZERO:
+        return None
+    project = task.project
+    if not project.is_paid:
+        return None
+
+    quote = Decimal(project.quote_usd or 0)
+    # This task's slice of the quote, so the field keeps meaning what it always
+    # meant and the per-line reporting needs no special case.
+    percent = _money(task.amount_usd / quote * 100) if quote else ZERO
+    earning, created = Earning.objects.get_or_create(
+        task=task,
+        user_id=task.assignee_id,
+        defaults={
+            "project": project,
+            "kind": Earning.Kind.EXPERT,
+            "share_percent": percent,
+            "amount_usd": _money(task.amount_usd),
+        },
+    )
+    return earning if created else None
 
 
 def record_project_earnings(project):
@@ -98,27 +140,58 @@ def record_project_earnings(project):
     return created
 
 
+def _involved(user):
+    """Every project this user stands to earn from, in any role."""
+    return (Q(experts=user) | Q(expert=user) | Q(lead=user)
+            | Q(business_developer=user))
+
+
 def backfill(user):
-    """Make sure every completed project this user earned on has a ledger row."""
+    """Make sure everything this user has earned has a ledger row.
+
+    Two sources now. Completed projects credit the lead, the business developer,
+    and — on a project with no priced tasks — the expert. Approved tasks credit
+    their assignee, whether or not the project itself has finished.
+
+    Both are idempotent, and both run on the read path, so a row that the write
+    path missed repairs itself the next time someone opens their earnings.
+    """
     completed = Project.objects.filter(
-        Q(expert=user) | Q(lead=user) | Q(business_developer=user),
-        stage=Project.Stage.COMPLETED
+        _involved(user), stage=Project.Stage.COMPLETED
     ).distinct()
     for project in completed:
         record_project_earnings(project)
 
+    uncredited = (Task.objects
+                  .filter(assignee=user, status=Task.Status.APPROVED,
+                          amount_usd__gt=0, earnings__isnull=True)
+                  .select_related("project"))
+    for task in uncredited:
+        record_task_earning(task)
+
 
 def _projected(user):
     """Not-yet-earned value from the user's paid-but-unapproved projects."""
-    active = Project.objects.filter(
-        Q(expert=user) | Q(lead=user) | Q(business_developer=user),
-        stage__in=PENDING_STAGES
-    ).distinct()
+    active = (Project.objects
+              .filter(_involved(user), stage__in=PENDING_STAGES)
+              .distinct()
+              .prefetch_related("tasks"))
     total = ZERO
     for project in active:
         split = project.payout_split()
         # One person can hold more than one role on a project; each counts.
-        if project.expert_id == user.id:
+        if project.uses_task_payouts:
+            # Their own outstanding tasks, not the project's whole expert share
+            # — on a team of four that would show each of them the same money.
+            # Approved tasks are already credited, so they belong to `earned`.
+            total += sum(
+                (t.amount_usd for t in project.tasks.all()
+                 if t.assignee_id == user.id
+                 and t.amount_usd > 0
+                 and t.status != Task.Status.APPROVED),
+                ZERO,
+            )
+        elif project.expert_id == user.id:
             total += split["expert_usd"]
         if project.lead_id == user.id:
             total += split["delivery_lead_usd"]
@@ -137,9 +210,7 @@ def has_custom_splits(user):
     The earnings screen quotes the site default; if some of a user's work pays
     differently, saying a flat "you earn X%" would be wrong.
     """
-    return Project.objects.filter(
-        Q(expert=user) | Q(lead=user) | Q(business_developer=user)
-    ).filter(
+    return Project.objects.filter(_involved(user)).filter(
         Q(expert_share_percent__isnull=False)
         | Q(delivery_lead_share_percent__isnull=False)
         | Q(business_dev_share_percent__isnull=False)

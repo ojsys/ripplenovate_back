@@ -1,9 +1,11 @@
 import logging
 
+from decimal import Decimal
 from pathlib import Path
 
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db import transaction
 from django.db.models import Q
 from django.http import FileResponse, Http404
 from django.utils import timezone
@@ -16,19 +18,26 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from . import notifications
-from .access import can_access_project, leads_project, visible_projects
+from .access import (
+    can_access_project,
+    is_project_expert,
+    leads_project,
+    visible_projects,
+)
 from .models import Activity, Attachment, Project, Task
 from .serializers import (
     ActivityCreateSerializer,
     AssignSerializer,
     AttachmentCreateSerializer,
     AttachmentSerializer,
+    ExpertListSerializer,
     ProjectCreateSerializer,
     ProjectDetailSerializer,
     ProjectEditSerializer,
     ProjectListSerializer,
     QuoteSerializer,
     TaskSerializer,
+    TaskWriteSerializer,
 )
 
 User = get_user_model()
@@ -132,7 +141,8 @@ class ProjectViewSet(mixins.ListModelMixin,
         user = self.request.user
         base = Project.objects.select_related(
             "client", "expert", "product_line", "service"
-        ).prefetch_related("tasks", "activity", "activity__attachments", "attachments")
+        ).prefetch_related("experts", "tasks", "activity",
+                           "activity__attachments", "attachments")
         if user.is_superuser:
             return base
         if user.role == Role.DELIVERY_LEAD:
@@ -147,7 +157,10 @@ class ProjectViewSet(mixins.ListModelMixin,
                 Q(lead=user) | (Q(lead__isnull=True) & Q(product_line__in=lines))
             ).distinct()
         if user.role == Role.EXPERT:
-            return base.filter(expert=user)
+            # Either shape of membership: on the team, or named as the primary
+            # expert. The two are kept in step, but an admin editing a project
+            # directly can set one without the other.
+            return base.filter(Q(experts=user) | Q(expert=user)).distinct()
         return base.filter(client=user)
 
     def get_serializer_class(self):
@@ -166,7 +179,7 @@ class ProjectViewSet(mixins.ListModelMixin,
         fresh = Project.objects.select_related(
             "client", "expert", "product_line", "service"
         ).prefetch_related(
-            "tasks", "activity", "activity__attachments", "attachments"
+            "experts", "tasks", "activity", "activity__attachments", "attachments"
         ).get(pk=project.pk)
         return Response(ProjectDetailSerializer(fresh).data, status=status_code)
 
@@ -322,7 +335,8 @@ class ProjectViewSet(mixins.ListModelMixin,
         user = request.user
         is_client = user.role == Role.CLIENT and project.client_id == user.id
         is_team = (self._is_lead()
-                   or (user.role == Role.EXPERT and project.expert_id == user.id))
+                   or (user.role == Role.EXPERT
+                       and is_project_expert(user, project)))
         if not (is_client or is_team):
             raise PermissionDenied("You can't add documents to this project.")
 
@@ -350,44 +364,180 @@ class ProjectViewSet(mixins.ListModelMixin,
         return Response(AttachmentSerializer(attachment).data,
                         status=status.HTTP_201_CREATED)
 
+    def _resolve_experts(self, project, expert_ids):
+        """Turn ids into experts who may actually take this brief.
+
+        An expert can only work in a discipline they cover. The picker already
+        filters to those, so this is the server-side backstop — and it now runs
+        per person rather than once, because a team is only as valid as its
+        least suitable member.
+        """
+        experts = []
+        for raw in expert_ids:
+            expert = User.objects.filter(id=raw, role=Role.EXPERT).first()
+            if not expert:
+                raise ValidationError("Select a valid expert.")
+            if (project.product_line_id
+                    and not expert.product_lines
+                                 .filter(id=project.product_line_id).exists()):
+                raise ValidationError(
+                    f"{expert.full_name or expert.email} doesn't work in "
+                    f"{project.product_line.name}. Add that product line to their "
+                    "profile first, or pick someone else."
+                )
+            experts.append(expert)
+        return experts
+
+    @staticmethod
+    def _names(people):
+        listed = [p.full_name or p.email for p in people]
+        if len(listed) == 1:
+            return listed[0]
+        return ", ".join(listed[:-1]) + f" and {listed[-1]}"
+
     @action(detail=True, methods=["post"])
     def assign(self, request, pk=None):
+        """Put a team on a paid brief and start delivery.
+
+        The first expert named is the primary — the one answerable for the whole
+        thing, and the one a project with no priced tasks pays in full.
+        """
         project = self.get_object()
         self._require_lead()
         if project.stage != Stage.PAID:
             raise ValidationError("An expert can only be assigned after payment.")
         serializer = AssignSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        expert = User.objects.filter(
-            id=serializer.validated_data["expert"], role=Role.EXPERT
-        ).first()
-        if not expert:
-            raise ValidationError("Select a valid expert.")
-        # An expert can only take work in a discipline they actually cover. The
-        # picker already filters to these, so this is the server-side backstop.
-        if (project.product_line_id
-                and not expert.product_lines.filter(id=project.product_line_id).exists()):
-            raise ValidationError(
-                f"{expert.full_name or expert.email} doesn't work in "
-                f"{project.product_line.name}. Add that product line to their "
-                "profile first, or pick someone else."
-            )
+        experts = self._resolve_experts(
+            project, serializer.validated_data["expert_ids"])
+        primary = experts[0]
+
         titles = [t.strip() for t in serializer.validated_data.get("tasks", []) if t.strip()]
-        project.expert = expert
+        project.expert = primary
         project.stage = Stage.IN_PROGRESS
         # Covers briefs that were paid before leads were tracked on the project.
         if not project.lead_id:
             project.lead = request.user
         project.save(update_fields=["expert", "stage", "lead"])
+        # The primary expert is always a member of the team too, so everything
+        # that asks "who is delivering this?" has one place to look.
+        project.experts.add(*experts)
         if titles:
-            project.tasks.all().delete()
+            # Only ever clears the seed list. A task that has been paid can't be
+            # deleted at all (the earning protects it), and none can exist yet —
+            # this runs once, on the way out of Paid.
+            project.tasks.filter(earnings__isnull=True).delete()
             Task.objects.bulk_create([
-                Task(project=project, title=t, assignee=expert, order=i)
+                Task(project=project, title=t, assignee=primary, order=i)
                 for i, t in enumerate(titles)
             ])
         log_activity(project, request.user,
-                     f"Assigned {expert.full_name} and kicked off delivery.")
-        notifications.notify_expert_assigned(project)
+                     f"Assigned {self._names(experts)} and kicked off delivery.")
+        notifications.notify_experts_assigned(project, experts)
+        return self._detail(project)
+
+    @action(detail=True, methods=["post"], url_path="tasks")
+    def create_task(self, request, pk=None):
+        """Add a task to the list, optionally priced and assigned."""
+        project = self.get_object()
+        self._require_lead()
+        _check_project_open(project)
+
+        serializer = TaskWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        _check_assignee(project, data.get("assignee"))
+        _check_allocation(project, data.get("amount_usd"))
+
+        if "order" not in data:
+            last = project.tasks.order_by("-order").first()
+            data["order"] = (last.order + 1) if last else 0
+        task = Task.objects.create(project=project, **data)
+
+        if task.amount_usd > 0 and task.assignee:
+            log_activity(
+                project, request.user,
+                f"Added “{task.title}” for {task.assignee.full_name or task.assignee.email} "
+                f"— ${task.amount_usd:,.2f} on approval."
+            )
+        return Response(TaskSerializer(task).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"], url_path="experts")
+    def add_experts(self, request, pk=None):
+        """Add experts to a project already in delivery."""
+        project = self.get_object()
+        self._require_lead()
+        if not project.is_paid:
+            raise ValidationError(
+                "Build the delivery team once the client has paid.")
+        serializer = ExpertListSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        experts = self._resolve_experts(
+            project, serializer.validated_data["expert_ids"])
+
+        already = {e.id for e in project.experts.all()}
+        added = [e for e in experts if e.id not in already]
+        if not added:
+            return self._detail(project)
+
+        project.experts.add(*added)
+        # A team with nobody answerable for it isn't a team. If the project has
+        # no primary yet, the first person on it becomes one.
+        if not project.expert_id:
+            project.expert = added[0]
+            project.save(update_fields=["expert"])
+        log_activity(project, request.user,
+                     f"Added {self._names(added)} to the delivery team.")
+        notifications.notify_experts_assigned(project, added)
+        return self._detail(project)
+
+    @action(detail=True, methods=["delete"],
+            url_path=r"experts/(?P<user_id>[^/.]+)")
+    def remove_expert(self, request, pk=None, user_id=None):
+        """Take an expert off the delivery team.
+
+        Refused once they've been paid for work here, or hold a task with a
+        price on it — money already credited can't be detached from the person
+        it was credited to, and a priced task is a commitment to pay. Reassign
+        or clear the task first, which is a decision for the lead to make
+        deliberately rather than a side effect of removing someone.
+        """
+        project = self.get_object()
+        self._require_lead()
+        expert = next((e for e in project.experts.all() if str(e.id) == str(user_id)),
+                      None)
+        if not expert:
+            raise ValidationError("That person isn't on this project's team.")
+
+        if project.earnings.filter(user=expert).exists():
+            raise ValidationError(
+                f"{expert.full_name or expert.email} has already been paid for "
+                "work on this project, so they stay on the record."
+            )
+        priced = project.tasks.filter(assignee=expert, amount_usd__gt=0)
+        if priced.exists():
+            raise ValidationError(
+                f"{expert.full_name or expert.email} still holds "
+                f"{priced.count()} priced task(s). Reassign them or clear their "
+                "amounts first."
+            )
+
+        # Their remaining tasks carry no money, but leaving them pointing at
+        # someone who's off the team would strand them. Unassigned is honest,
+        # and the activity line says so rather than it happening quietly.
+        orphaned = project.tasks.filter(assignee=expert).update(assignee=None)
+        project.experts.remove(expert)
+        if project.expert_id == expert.id:
+            # Hand the primary role to whoever is left, or leave it empty.
+            successor = project.experts.exclude(id=expert.id).first()
+            project.expert = successor
+            project.save(update_fields=["expert"])
+
+        text = f"Removed {expert.full_name or expert.email} from the delivery team."
+        if orphaned:
+            text += f" {orphaned} task(s) are now unassigned."
+        log_activity(project, request.user, text)
         return self._detail(project)
 
     def _is_lead(self):
@@ -409,7 +559,7 @@ class ProjectViewSet(mixins.ListModelMixin,
         the lead often needs to move it along on the expert's behalf."""
         project = self.get_object()
         is_assigned_expert = (request.user.role == Role.EXPERT
-                           and project.expert_id == request.user.id)
+                              and is_project_expert(request.user, project))
         if not (is_assigned_expert or self._is_lead()):
             raise PermissionDenied(
                 "Only the assigned expert or a delivery lead can submit for review."
@@ -430,7 +580,7 @@ class ProjectViewSet(mixins.ListModelMixin,
         """Nudge the client again while a project is sitting in review."""
         project = self.get_object()
         is_assigned_expert = (request.user.role == Role.EXPERT
-                           and project.expert_id == request.user.id)
+                              and is_project_expert(request.user, project))
         if not (is_assigned_expert or self._is_lead()):
             raise PermissionDenied("Only the delivery team can send that reminder.")
         if project.stage != Stage.REVIEW:
@@ -497,7 +647,8 @@ class ProjectViewSet(mixins.ListModelMixin,
         user = request.user
         is_client = user.role == Role.CLIENT and project.client_id == user.id
         is_team = (self._is_lead()
-                   or (user.role == Role.EXPERT and project.expert_id == user.id))
+                   or (user.role == Role.EXPERT
+                       and is_project_expert(user, project)))
         if not (is_client or is_team):
             raise PermissionDenied("You can't add links to this project.")
 
@@ -520,27 +671,250 @@ class ProjectViewSet(mixins.ListModelMixin,
                         status=status.HTTP_201_CREATED)
 
 
-@api_view(["PATCH"])
-@permission_classes([IsAuthenticated])
-def toggle_task(request, task_id):
-    task = Task.objects.select_related("project", "project__expert",
-                                       "project__client").filter(id=task_id).first()
+def _writable_task(request, task_id):
+    """Fetch a task the requesting lead is allowed to change, or raise.
+
+    Only a delivery lead running the project maintains its task list. Experts
+    move their own tasks through the lifecycle instead — a separate thing, with
+    separate rules, because that path is what releases money.
+    """
+    task = (Task.objects
+            .select_related("project", "project__expert", "project__product_line")
+            .filter(id=task_id)
+            .first())
     if not task:
-        return Response({"detail": "Task not found."}, status=status.HTTP_404_NOT_FOUND)
-    project = task.project
-    user = request.user
-    # Scoped by the project, not by the role: `role == DELIVERY_LEAD` is true
-    # for every lead on the platform, so it let any of them tick off tasks on
-    # work they have nothing to do with.
-    allowed = (
-        leads_project(user, project)
-        or (user.role == Role.EXPERT and project.expert_id == user.id)
-    )
-    if not allowed:
+        raise Http404
+    if not leads_project(request.user, task.project):
         raise PermissionDenied("You can't change tasks on this project.")
-    task.done = not task.done
-    task.save(update_fields=["done"])
+    return task
+
+
+def _check_task_writable(task):
+    """A task stops being editable once the expert has handed it in.
+
+    Re-pricing work someone has already done — or already been paid for — is
+    changing the deal after the fact. Send it back with `request-changes` if it
+    needs more work; that returns it to the lead's control honestly.
+    """
+    if task.status == Task.Status.APPROVED:
+        raise ValidationError(
+            "This task is approved and settled — its details are fixed.")
+    if task.status == Task.Status.SUBMITTED:
+        raise ValidationError(
+            "This task is waiting on your review. Approve it, or request "
+            "changes, before editing it."
+        )
+
+
+def _check_allocation(project, amount, replacing=Decimal("0")):
+    """Keep the task amounts inside the project's expert share.
+
+    The invariant the whole feature rests on: the platform can't be made to pay
+    out more than it took in. `replacing` is the amount this write is
+    overwriting, so editing a task counts its own old value as freed.
+    """
+    amount = Decimal(amount or 0)
+    if amount <= 0:
+        return
+    pool = project.expert_pool_usd
+    committed = project.allocated_usd - Decimal(replacing or 0)
+    if committed + amount > pool:
+        remaining = pool - committed
+        raise ValidationError(
+            f"That's more than this project has left to allocate. The expert "
+            f"share is ${pool:,.2f} and ${remaining:,.2f} is unallocated."
+        )
+
+
+def _check_assignee(project, assignee):
+    """Tasks go to people who are actually on the project."""
+    if assignee and not is_project_expert(assignee, project):
+        raise ValidationError(
+            f"{assignee.full_name or assignee.email} isn't on this project's "
+            "delivery team. Add them to the team first."
+        )
+
+
+def _check_project_open(project):
+    if not project.is_paid:
+        raise ValidationError("Tasks are set up once the client has paid.")
+    if project.stage == Stage.COMPLETED:
+        raise ValidationError(
+            "This project is complete — its task list is part of the record now.")
+
+
+@api_view(["PATCH", "DELETE"])
+@permission_classes([IsAuthenticated])
+def task_detail(request, task_id):
+    """Maintain one task on a project's list — the delivery lead's job."""
+    if request.method == "DELETE":
+        return _delete_task(request, task_id)
+    return _update_task(request, task_id)
+
+
+def _update_task(request, task_id):
+    """Retitle, re-price, or reassign a task that hasn't been handed in yet."""
+    task = _writable_task(request, task_id)
+    project = task.project
+    _check_project_open(project)
+    _check_task_writable(task)
+
+    serializer = TaskWriteSerializer(task, data=request.data, partial=True)
+    serializer.is_valid(raise_exception=True)
+    updates = serializer.validated_data
+
+    if "assignee" in updates:
+        _check_assignee(project, updates["assignee"])
+    if "amount_usd" in updates:
+        _check_allocation(project, updates["amount_usd"], replacing=task.amount_usd)
+
+    for field, value in updates.items():
+        setattr(task, field, value)
+    task.save(update_fields=list(updates) or None)
     return Response(TaskSerializer(task).data)
+
+
+def _task_or_404(task_id):
+    return (Task.objects
+            .select_related("project", "project__client", "project__expert",
+                            "assignee")
+            .filter(id=task_id)
+            .first())
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def submit_task(request, task_id):
+    """Hand a task in for the lead to check.
+
+    The assignee only — not the lead "on their behalf". A lead who could both
+    submit and approve would be the whole chain on their own, and approval is
+    what releases the money.
+
+    If an expert goes quiet, the way through is to reassign the task while it's
+    still open, not to submit for them.
+    """
+    task = _task_or_404(task_id)
+    if not task:
+        raise Http404
+    if task.assignee_id != request.user.id:
+        raise PermissionDenied("Only the person a task is assigned to can hand it in.")
+    if task.status == Task.Status.APPROVED:
+        raise ValidationError("This task has already been approved.")
+    if task.status == Task.Status.SUBMITTED:
+        raise ValidationError("This task is already waiting on review.")
+
+    task.status = Task.Status.SUBMITTED
+    task.submitted_at = timezone.now()
+    task.save(update_fields=["status", "submitted_at"])
+    log_activity(task.project, request.user,
+                 f"Submitted “{task.title}” for review.")
+    notifications.notify_task_submitted(task)
+    return Response(TaskSerializer(task).data)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def approve_task(request, task_id):
+    """Sign a task off — and pay for it.
+
+    Terminal, deliberately. The earning it writes is withdrawable immediately,
+    so there is no coming back from here; a lead who isn't sure should request
+    changes instead.
+    """
+    from payments import earnings as earnings_service
+    from payments import notifications as payout_notifications
+
+    task = _task_or_404(task_id)
+    if not task:
+        raise Http404
+    project = task.project
+    if not leads_project(request.user, project):
+        raise PermissionDenied("Only the delivery lead running this project can approve a task.")
+    # The rule payouts already follow one step further down the chain, where
+    # nobody settles their own withdrawal. A lead holding a task of their own
+    # needs another lead to sign it off.
+    if task.assignee_id == request.user.id:
+        raise PermissionDenied(
+            "You can't approve your own task — ask another delivery lead or an admin."
+        )
+    if task.status == Task.Status.APPROVED:
+        raise ValidationError("This task is already approved.")
+    if task.status != Task.Status.SUBMITTED:
+        raise ValidationError(
+            "This task hasn't been handed in yet. It can be approved once the "
+            "expert submits it for review."
+        )
+    if not project.is_paid:
+        raise ValidationError("Nothing is paid out before the client has.")
+
+    # The status change and the payment are one thing. If crediting fails the
+    # approval has to fail with it — a task that reads approved but was never
+    # paid is the worst of both, and it's terminal, so nothing would retry it.
+    with transaction.atomic():
+        task.status = Task.Status.APPROVED
+        task.approved_at = timezone.now()
+        task.approved_by = request.user
+        task.save(update_fields=["status", "approved_at", "approved_by"])
+        earning = earnings_service.record_task_earning(task)
+
+    if earning:
+        log_activity(
+            project, request.user,
+            f"Approved “{task.title}” — ${earning.amount_usd:,.2f} released to "
+            f"{task.assignee.full_name or task.assignee.email}."
+        )
+        payout_notifications.notify_task_earning_credited(task, earning.amount_usd)
+    else:
+        log_activity(project, request.user, f"Approved “{task.title}”.")
+    notifications.notify_task_approved(task)
+    return Response(TaskSerializer(task).data)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def request_task_changes(request, task_id):
+    """Send a submitted task back, with a reason.
+
+    The note isn't optional. "Changes requested" with nothing attached leaves
+    the expert guessing at what stands between them and being paid.
+    """
+    task = _task_or_404(task_id)
+    if not task:
+        raise Http404
+    if not leads_project(request.user, task.project):
+        raise PermissionDenied("Only the delivery lead running this project can review a task.")
+    if task.status != Task.Status.SUBMITTED:
+        raise ValidationError("This task isn't waiting on review.")
+
+    note = (request.data.get("note") or "").strip()
+    if not note:
+        raise ValidationError("Say what needs changing.")
+
+    task.status = Task.Status.CHANGES
+    task.submitted_at = None
+    task.save(update_fields=["status", "submitted_at"])
+    log_activity(task.project, request.user,
+                 f"Requested changes on “{task.title}” — {note}")
+    notifications.notify_task_changes_requested(task, note)
+    return Response(TaskSerializer(task).data)
+
+
+def _delete_task(request, task_id):
+    """Drop a task from the list.
+
+    Refused once it has been paid — an earning protects its task at the
+    database level, and answering with a clear reason beats a 500 from the
+    ProtectedError underneath.
+    """
+    task = _writable_task(request, task_id)
+    if task.earnings.exists():
+        raise ValidationError(
+            "This task has been paid, so it stays on the record. "
+            "Its amount is part of what the project has already paid out."
+        )
+    task.delete()
+    return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 @api_view(["GET"])

@@ -276,9 +276,15 @@ class Command(BaseCommand):
                 # Quoted briefs and beyond are owned by the lead who quoted them.
                 lead=lead if spec["stage"] != Stage.SUBMITTED else None,
             )
+            # The primary expert is always on the team as well.
+            if spec["expert"]:
+                project.experts.add(spec["expert"])
             for i, (title, done) in enumerate(spec["tasks"]):
-                Task.objects.create(project=project, title=title, done=done,
-                                    assignee=spec["expert"], order=i)
+                Task.objects.create(
+                    project=project, title=title, order=i,
+                    assignee=spec["expert"],
+                    status=Task.Status.APPROVED if done else Task.Status.TODO,
+                )
             for entry in spec["activity"]:
                 author, text = entry[0], entry[1]
                 kind = entry[2] if len(entry) > 2 else Activity.Kind.SYSTEM

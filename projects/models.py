@@ -67,9 +67,24 @@ class Project(models.Model):
     description = models.TextField()
     stage = models.CharField(max_length=20, choices=Stage.choices, default=Stage.SUBMITTED)
     quote_usd = models.PositiveIntegerField(default=0)
+    # The expert who owns delivery. One of `experts`, always — the team is the
+    # M2M below; this names the person answerable for the whole brief.
+    #
+    # It also carries the legacy payout path: a project with no priced tasks
+    # pays its entire expert share to this person on completion, which is what
+    # every project did before task payouts existed.
     expert = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
-        null=True, blank=True, related_name="assigned_projects",
+        null=True, blank=True, related_name="primary_expert_projects",
+        verbose_name="Primary expert",
+    )
+    # Everyone delivering this brief. A lead builds a team here and then splits
+    # the expert share across tasks assigned to its members.
+    experts = models.ManyToManyField(
+        settings.AUTH_USER_MODEL, blank=True, related_name="assigned_projects",
+        limit_choices_to={"role": "expert"},
+        help_text="The experts delivering this project. Tasks can only be "
+                  "assigned to someone on this list.",
     )
     # The delivery lead who quoted the brief — earns the lead share on completion.
     lead = models.ForeignKey(
@@ -144,6 +159,21 @@ class Project(models.Model):
                 "The expert, delivery lead and business developer shares can't add "
                 f"up to more than 100% of the quote (currently {total}%)."
             )
+        # Shrinking the expert share below what's already promised to tasks
+        # would leave the project owing more than it holds. The API refuses
+        # over-allocation on the way in; this is the same rule reached from the
+        # other direction, which is the one the Django admin can take.
+        if self.pk:
+            allocated = self.allocated_usd
+            if allocated > self.expert_pool_usd:
+                raise ValidationError({
+                    "expert_share_percent": (
+                        f"This project's tasks already allocate ${allocated:,.2f}, "
+                        f"which is more than a {self.expert_share_percent}% share "
+                        f"of a ${self.quote_usd:,} quote (${self.expert_pool_usd:,.2f}). "
+                        "Re-price the tasks first."
+                    )
+                })
 
     def payout_split(self):
         """How this project's quote divides — expert, lead, business dev, platform.
@@ -182,8 +212,15 @@ class Project(models.Model):
         credited = {}
         if self.stage == self.Stage.COMPLETED:
             for earning in self.earnings.all():
-                amount, pct = credited.get(earning.kind, (Decimal("0"), earning.share_percent))
-                credited[earning.kind] = (amount + earning.amount_usd, pct)
+                amount, pct = credited.get(earning.kind, (Decimal("0"), Decimal("0")))
+                # Both totals accumulate. The expert share can now arrive as one
+                # row per approved task, and each row's `share_percent` is that
+                # task's slice of the quote — so they sum to the share actually
+                # paid, exactly as a single legacy row's percent did on its own.
+                # Taking the percent from whichever row came first would have
+                # reported one task's slice as the whole expert share.
+                credited[earning.kind] = (amount + earning.amount_usd,
+                                          pct + earning.share_percent)
 
         def part(kind, pct):
             """What was credited if it has been, else what's projected."""
@@ -215,6 +252,45 @@ class Project(models.Model):
                               or self.business_dev_share_percent is not None),
             "is_settled": bool(credited),
         }
+
+    @property
+    def expert_pool_usd(self):
+        """The whole expert share of the quote, before it's split across tasks.
+
+        Computed from the percentages alone, deliberately. `payout_split()`
+        switches to reporting credited amounts once a project completes — right
+        for reporting, wrong for allocation, which has to keep answering the
+        same question after the money has moved.
+        """
+        from accounts.models import SiteSettings  # local: keeps app imports one-way
+
+        pct = (self.expert_share_percent
+               if self.expert_share_percent is not None
+               else Decimal(SiteSettings.payout_config()["expert_share_percent"]))
+        return _money(_money(self.quote_usd) * pct / Decimal(100))
+
+    @property
+    def allocated_usd(self):
+        """What the priced tasks on this project add up to."""
+        # Summed in Python rather than aggregated, so a prefetched task list
+        # (the detail view, the board) doesn't trigger another query per project.
+        return _money(sum((t.amount_usd for t in self.tasks.all()), Decimal("0")))
+
+    @property
+    def unallocated_usd(self):
+        """Pool left to hand out. Negative would mean over-allocation, which the
+        task write path refuses — this is the number the UI shows a lead."""
+        return _money(self.expert_pool_usd - self.allocated_usd)
+
+    @property
+    def uses_task_payouts(self):
+        """Whether experts on this project are paid per task.
+
+        Derived rather than flagged, so it can't drift out of step with the
+        tasks themselves. A project with nothing priced takes the legacy path:
+        the whole expert share to `expert` when the client approves delivery.
+        """
+        return any(t.amount_usd > 0 for t in self.tasks.all())
 
     @property
     def cycle_days(self):
@@ -278,19 +354,73 @@ class Project(models.Model):
 
 
 class Task(models.Model):
+    """A unit of work on a project, assigned to one expert and worth an amount.
+
+    A task carries money. The expert does the work and submits it; the delivery
+    lead checks it and approves it; approving is what credits the expert's
+    earning. That second pair of eyes is the point — it's the same rule payouts
+    already follow, where nobody settles their own withdrawal.
+
+    `amount_usd` is drawn from the project's expert share. The sum of a
+    project's tasks can never exceed `Project.expert_pool_usd`, so the platform
+    can't be made to pay out more than it took in.
+    """
+
+    class Status(models.TextChoices):
+        TODO = "todo", "To do"
+        SUBMITTED = "submitted", "Submitted for review"
+        CHANGES = "changes", "Changes requested"
+        # Terminal, and the reason there is no way back: approval releases the
+        # money, which may be withdrawn before anyone changes their mind.
+        APPROVED = "approved", "Approved"
+
     project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="tasks")
     title = models.CharField(max_length=255)
+    # What "done" means for this task. Vague tasks are what approval disputes
+    # are made of, and there's money on the other side of this one.
+    description = models.TextField(blank=True)
     assignee = models.ForeignKey(
-        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="tasks",
     )
-    done = models.BooleanField(default=False)
+    amount_usd = models.DecimalField(
+        "Amount (USD)", max_digits=10, decimal_places=2, default=Decimal("0.00"),
+        validators=[MinValueValidator(Decimal("0"))],
+        help_text="What the assignee earns when this task is approved. Comes out "
+                  "of the project's expert share.",
+    )
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.TODO)
     order = models.PositiveIntegerField(default=0)
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    approved_at = models.DateTimeField(null=True, blank=True)
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="approved_tasks",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, null=True)
 
     class Meta:
         ordering = ["order", "id"]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(amount_usd__gte=Decimal("0")),
+                name="task_amount_not_negative",
+            ),
+        ]
 
     def __str__(self):
         return self.title
+
+    @property
+    def done(self):
+        """Kept so everything reading tasks — the board, progress, the mobile
+        list — keeps working while the lifecycle grows underneath it."""
+        return self.status == self.Status.APPROVED
+
+    @property
+    def is_paid_work(self):
+        """Whether approving this task will move money."""
+        return self.amount_usd > 0
 
 
 class Activity(models.Model):

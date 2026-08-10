@@ -91,8 +91,10 @@ class ProjectScopeTests(TestCase):
     def download(self, user):
         return as_user(user).get(f"/api/attachments/{self.document.id}/download")
 
-    def toggle(self, user):
-        return as_user(user).patch(f"/api/tasks/{self.task.id}/toggle")
+    def edit_task(self, user):
+        """Maintaining the task list is the running lead's job."""
+        return as_user(user).patch(f"/api/tasks/{self.task.id}",
+                                   {"title": "Renamed"}, format="json")
 
     def delete_link(self, user):
         return as_user(user).delete(f"/api/attachments/{self.a_link().id}")
@@ -107,7 +109,7 @@ class ProjectScopeTests(TestCase):
     def test_a_lead_from_another_discipline_is_shut_out(self):
         """The regression. Every one of these used to succeed."""
         self.assertEqual(self.download(self.foreign_lead).status_code, 403)
-        self.assertEqual(self.toggle(self.foreign_lead).status_code, 403)
+        self.assertEqual(self.edit_task(self.foreign_lead).status_code, 403)
         self.assertEqual(self.delete_link(self.foreign_lead).status_code, 403)
         self.assertEqual(self.invoice(self.foreign_lead).status_code, 403)
 
@@ -120,7 +122,7 @@ class ProjectScopeTests(TestCase):
 
     def test_a_lead_still_in_review_cannot_act_on_the_work(self):
         """Approval gates acting on a project, not just quoting it."""
-        self.assertEqual(self.toggle(self.pending_lead).status_code, 403)
+        self.assertEqual(self.edit_task(self.pending_lead).status_code, 403)
         self.assertEqual(self.delete_link(self.pending_lead).status_code, 403)
         self.task.refresh_from_db()
         self.assertFalse(self.task.done)
@@ -128,7 +130,7 @@ class ProjectScopeTests(TestCase):
     def test_experts_and_clients_off_the_project_are_shut_out(self):
         for outsider in (self.foreign_expert, self.nosy_client):
             self.assertEqual(self.download(outsider).status_code, 403)
-            self.assertEqual(self.toggle(outsider).status_code, 403)
+            self.assertEqual(self.edit_task(outsider).status_code, 403)
             self.assertEqual(self.invoice(outsider).status_code, 403)
             self.assertEqual(self.detail(outsider).status_code, 404)
 
@@ -138,7 +140,7 @@ class ProjectScopeTests(TestCase):
         and it leaves every other board."""
         self.assertEqual(self.detail(self.peer_lead).status_code, 404)
         self.assertEqual(self.download(self.peer_lead).status_code, 403)
-        self.assertEqual(self.toggle(self.peer_lead).status_code, 403)
+        self.assertEqual(self.edit_task(self.peer_lead).status_code, 403)
         self.assertEqual(self.delete_link(self.peer_lead).status_code, 403)
         self.assertEqual(self.invoice(self.peer_lead).status_code, 403)
         self.assertEqual(
@@ -166,9 +168,13 @@ class ProjectScopeTests(TestCase):
         self.assertEqual(self.download(self.bizdev).status_code, 200)
 
     def test_the_lead_who_runs_it_can_still_work_the_project(self):
-        for insider in (self.lead, self.admin, self.expert):
-            self.assertEqual(self.toggle(insider).status_code, 200,
+        for insider in (self.lead, self.admin):
+            self.assertEqual(self.edit_task(insider).status_code, 200,
                              f"{insider.email} lost task access")
+        # The expert delivers the work; the lead maintains the list. An expert
+        # re-pricing their own task would be setting their own fee.
+        self.assertEqual(self.edit_task(self.expert).status_code, 403)
+        for insider in (self.lead, self.admin, self.expert):
             self.assertEqual(self.delete_link(insider).status_code, 204,
                              f"{insider.email} lost attachment access")
 

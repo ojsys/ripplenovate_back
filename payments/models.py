@@ -34,14 +34,22 @@ class Payment(models.Model):
 
 
 class Earning(models.Model):
-    """A realized share of a delivered project.
+    """A realized share of delivered work.
 
-    Credited to the assigned expert, the delivery lead who quoted it, and the
-    business developer who sourced it (when there is one).
+    Credited to the experts who delivered it, the delivery lead who quoted it,
+    and the business developer who sourced it (when there is one).
 
-    One row per (project, earner, role). Rows are only written once the client
-    approves delivery, so the sum of a user's earnings is money actually earned —
-    anything still in flight is projected on the fly instead.
+    Rows come in two shapes:
+
+    * **Project-level** (``task`` is null) — the lead's share, the business
+      developer's commission, and, on a project with no priced tasks, the whole
+      expert share. Written when the client approves delivery.
+    * **Task-level** (``task`` is set) — one expert's payment for one approved
+      task. Written when the delivery lead approves that task, which can happen
+      well before the project itself completes.
+
+    Either way a row means money actually earned; anything still in flight is
+    projected on the fly instead, never written here.
     """
 
     class Kind(models.TextChoices):
@@ -53,6 +61,14 @@ class Earning(models.Model):
         settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="earnings"
     )
     project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="earnings")
+    # Set on an expert's payment for a single approved task; null on the
+    # project-level shares. PROTECT, not CASCADE: deleting a task must never
+    # quietly delete a payment, which makes a paid task undeletable — correct,
+    # because by then it's a financial record rather than a to-do.
+    task = models.ForeignKey(
+        "projects.Task", on_delete=models.PROTECT,
+        null=True, blank=True, related_name="earnings",
+    )
     kind = models.CharField(max_length=20, choices=Kind.choices)
     # Snapshot of the share that produced this amount, so history stays readable
     # after an admin edits the percentages.
@@ -62,10 +78,20 @@ class Earning(models.Model):
 
     class Meta:
         ordering = ["-created_at", "-id"]
+        # Two constraints rather than one, because a NULL `task` can't take part
+        # in a plain unique index — every project-level row would look distinct
+        # from every other and the "once per role" rule would stop holding.
         constraints = [
             models.UniqueConstraint(
-                fields=["project", "user", "kind"], name="unique_earning_per_role"
-            )
+                fields=["project", "user", "kind"],
+                condition=models.Q(task__isnull=True),
+                name="unique_project_earning_per_role",
+            ),
+            models.UniqueConstraint(
+                fields=["task", "user"],
+                condition=models.Q(task__isnull=False),
+                name="unique_task_earning_per_user",
+            ),
         ]
 
     def __str__(self):

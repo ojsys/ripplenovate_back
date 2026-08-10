@@ -40,6 +40,19 @@ def _lead_emails():
     )
 
 
+def _team_emails(project):
+    """Every expert delivering this project.
+
+    Includes the primary expert whether or not the team membership was written
+    — an admin can set one directly — so nobody working on a brief misses word
+    that it changed.
+    """
+    emails = {e.email for e in project.experts.all()}
+    if project.expert_id:
+        emails.add(project.expert.email)
+    return emails
+
+
 def _money(n):
     return "${:,}".format(int(n or 0))
 
@@ -103,8 +116,7 @@ def notify_payment_received(project):
 def notify_project_edited(project, summary, repriced=False):
     """Tell the client (and the assigned expert) that the lead changed something."""
     recipients = {project.client.email}
-    if project.expert:
-        recipients.add(project.expert.email)
+    recipients.update(_team_emails(project))
     paragraphs = [f"The delivery team updated “{project.title}”:", summary]
     if repriced:
         paragraphs.append(
@@ -120,27 +132,44 @@ def notify_project_edited(project, summary, repriced=False):
     )
 
 
+def _names(people):
+    """"Ada", or "Ada and Chidi", or "Ada, Chidi and Zainab"."""
+    listed = [p.full_name or p.email for p in people]
+    if not listed:
+        return "an expert"
+    if len(listed) == 1:
+        return listed[0]
+    return ", ".join(listed[:-1]) + f" and {listed[-1]}"
+
+
 @_safe
-def notify_expert_assigned(project):
-    if project.expert:
+def notify_experts_assigned(project, experts=None):
+    """Tell each new expert they're on, and the client that work has started.
+
+    Addressed one at a time rather than as a group: "You've been assigned" in a
+    mail visibly sent to four people reads as somebody else's job.
+    """
+    experts = list(experts if experts is not None else project.experts.all())
+    for expert in experts:
         send_brand_email(
             subject=f"You've been assigned: {project.title}",
-            to=project.expert.email,
+            to=expert.email,
             heading="You've got a new project",
             paragraphs=[
-                f"Hi {project.expert.full_name or 'there'},",
-                f"You've been assigned to build “{project.title}” for {project.company}.",
+                f"Hi {expert.full_name or 'there'},",
+                f"You've been assigned to work on “{project.title}” for {project.company}.",
                 "Open your task board to see the breakdown, check off tasks, and post progress updates.",
             ],
             cta=("Open my tasks", f"{_frontend()}/tasks"),
         )
-    expert_name = project.expert.full_name if project.expert else "an expert"
+    expert_name = _names(experts)
     send_brand_email(
         subject=f"Work has started on {project.title}",
         to=project.client.email,
         heading="Your project is underway",
         paragraphs=[
-            f"Good news — {expert_name} has been assigned to “{project.title}” and work has begun.",
+            f"Good news — {expert_name} {'have' if len(experts) > 1 else 'has'} been "
+            f"assigned to “{project.title}” and work has begun.",
             "You'll get updates as milestones are hit, and you can follow progress live any time.",
         ],
         cta=("Follow progress", _project_url(project)),
@@ -152,8 +181,7 @@ def notify_update_posted(project, activity):
     """Notify everyone involved (except the author) when a progress update is posted."""
     author_email = activity.author.email if activity.author else None
     recipients = {project.client.email}
-    if project.expert:
-        recipients.add(project.expert.email)
+    recipients.update(_team_emails(project))
     recipients.update(_lead_emails())
     recipients.discard(author_email)
     kind_label = activity.get_kind_display()
@@ -209,8 +237,7 @@ def notify_project_completed(project, completed_by_client=True):
     should never find a project completed without hearing why.
     """
     recipients = set(_lead_emails())
-    if project.expert:
-        recipients.add(project.expert.email)
+    recipients.update(_team_emails(project))
     who = (f"{_client_name(project)} approved delivery of"
            if completed_by_client else
            "The delivery team marked")
@@ -267,3 +294,74 @@ def notify_attribution_changed(project, previous, current):
                 "If that looks wrong, reply to this email and we'll take a look.",
             ],
         )
+
+
+def _money2(n):
+    """Task amounts carry cents; project quotes never have."""
+    return "${:,.2f}".format(n or 0)
+
+
+@_safe
+def notify_task_submitted(task):
+    """Tell the lead running the project that work is waiting on them.
+
+    Only the lead: approving is their call, and a task sitting unreviewed is
+    money the expert can't reach yet.
+    """
+    project = task.project
+    if not project.lead:
+        return
+    worth = (f" It's worth {_money2(task.amount_usd)} on approval."
+             if task.amount_usd > 0 else "")
+    send_brand_email(
+        subject=f"Ready for review: {task.title}",
+        to=project.lead.email,
+        heading="A task was submitted for review",
+        paragraphs=[
+            f"{task.assignee.full_name or task.assignee.email} submitted "
+            f"“{task.title}” on “{project.title}”.{worth}",
+            "Approve it once you're happy with the work, or send it back with "
+            "a note on what needs changing.",
+        ],
+        cta=("Review the task", _project_url(project)),
+    )
+
+
+@_safe
+def notify_task_approved(task):
+    """Tell the client their project moved, without naming anyone's fee.
+
+    What an expert is paid is between them and the platform — it has no place
+    in a client's inbox.
+    """
+    project = task.project
+    send_brand_email(
+        subject=f"Progress on {project.title}",
+        to=project.client.email,
+        heading="A piece of your project is done",
+        paragraphs=[
+            f"“{task.title}” has been completed and signed off on "
+            f"“{project.title}”.",
+            "You can follow the rest of the work live any time.",
+        ],
+        cta=("Follow progress", _project_url(project)),
+    )
+
+
+@_safe
+def notify_task_changes_requested(task, note):
+    project = task.project
+    if not task.assignee:
+        return
+    send_brand_email(
+        subject=f"Changes requested: {task.title}",
+        to=task.assignee.email,
+        heading="Your task needs another look",
+        paragraphs=[
+            f"Hi {task.assignee.full_name or 'there'},",
+            f"The delivery lead sent “{task.title}” back on “{project.title}”:",
+            f"“{note}”",
+            "Make the changes and submit it again when you're ready.",
+        ],
+        cta=("Open the project", _project_url(project)),
+    )

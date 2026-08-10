@@ -8,11 +8,17 @@ class EarningSerializer(serializers.ModelSerializer):
     project_title = serializers.CharField(source="project.title", read_only=True)
     project_id = serializers.IntegerField(source="project.id", read_only=True)
     kind_label = serializers.CharField(source="get_kind_display", read_only=True)
+    # Set on an expert's payment for one approved task. Null on the
+    # project-level shares, which is how the ledger tells "your share of this
+    # project" apart from "you were paid for this piece of it".
+    task_title = serializers.CharField(source="task.title", read_only=True,
+                                       default=None)
 
     class Meta:
         model = Earning
         fields = [
             "id", "project_id", "project_code", "project_title",
+            "task", "task_title",
             "kind", "kind_label", "share_percent", "amount_usd", "created_at",
         ]
 

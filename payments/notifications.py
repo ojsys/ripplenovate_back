@@ -64,6 +64,31 @@ def notify_earning_credited(user, project, amount_usd):
 
 
 @_safe
+def notify_task_earning_credited(task, amount_usd):
+    """One task signed off, one payment released.
+
+    Separate from `notify_earning_credited` because the reason differs: this one
+    lands mid-project, on the lead's approval of a specific piece of work, not
+    on the client closing the whole thing out. Saying "the client approved your
+    project" here would be untrue and would set the wrong expectation about
+    what's left to do.
+    """
+    if not task.assignee:
+        return
+    send_brand_email(
+        subject=f"You've earned {_usd(amount_usd)}",
+        to=task.assignee.email,
+        heading=f"{_usd(amount_usd)} added to your earnings",
+        paragraphs=[
+            f"Hi {_first_name(task.assignee)},",
+            f"“{task.title}” on “{task.project.title}” was approved by your "
+            f"delivery lead, so {_usd(amount_usd)} is now available to withdraw.",
+        ],
+        cta=("View my earnings", _earnings_url()),
+    )
+
+
+@_safe
 def notify_withdrawal_requested(withdrawal):
     """Confirm to the earner, and queue it up for whoever settles payouts."""
     send_brand_email(

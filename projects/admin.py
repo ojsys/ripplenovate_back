@@ -17,7 +17,7 @@ def _pct(value):
 class TaskInline(admin.TabularInline):
     model = Task
     extra = 0
-    fields = ("title", "assignee", "done", "order")
+    fields = ("title", "assignee", "amount_usd", "status", "order")
 
 
 class ActivityInline(admin.TabularInline):
@@ -42,14 +42,20 @@ class ProjectAdmin(admin.ModelAdmin):
     list_filter = ("stage", "category", "product_line")
     search_fields = ("code", "title", "company", "client__full_name", "client__email")
     autocomplete_fields = ("client", "expert", "lead", "business_developer")
+    filter_horizontal = ("experts",)
     readonly_fields = ("code", "created_at", "payout_breakdown")
     date_hierarchy = "created_at"
     inlines = [TaskInline, AttachmentInline, ActivityInline]
     fieldsets = (
         (None, {"fields": ("code", "title", "client", "company", "category")}),
         ("Brief", {"fields": ("description", "timeline", "budget_range", "target_date")}),
-        ("Delivery", {"fields": ("stage", "quote_usd", "expert", "lead",
-                                 "business_developer")}),
+        ("Delivery", {
+            "fields": ("stage", "quote_usd", "expert", "experts", "lead",
+                       "business_developer"),
+            "description": "“Primary expert” owns the brief and is who a project "
+                           "with no priced tasks pays in full. Keep them in the "
+                           "team list as well.",
+        }),
         ("Payout split", {
             "fields": ("payout_breakdown", "expert_share_percent",
                        "business_dev_share_percent",
@@ -236,9 +242,10 @@ class ProjectAdmin(admin.ModelAdmin):
 
 @admin.register(Task)
 class TaskAdmin(admin.ModelAdmin):
-    list_display = ("title", "project", "assignee", "done", "order")
-    list_filter = ("done",)
+    list_display = ("title", "project", "assignee", "amount_usd", "status", "order")
+    list_filter = ("status",)
     search_fields = ("title", "project__code", "project__title")
+    readonly_fields = ("submitted_at", "approved_at", "approved_by", "created_at")
 
 
 @admin.register(Activity)
