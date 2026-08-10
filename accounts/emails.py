@@ -291,3 +291,40 @@ def send_kyc_rejected(user, reason=""):
         paragraphs=paragraphs,
         cta=("Update my details", _link("/profile")),
     )
+
+
+def notify_roster_changed(expert, new_lead, previous_lead=None):
+    """Tell an expert they've joined a lead's team, and the lead who lost them.
+
+    A roster move needs no admin sign-off — capacity decides whether an expert
+    can take work, not which lead first signed them up. But it shouldn't be
+    silent either: the lead they were with finds out here rather than by
+    noticing an absence in their picker.
+    """
+    lead_name = new_lead.full_name or new_lead.email
+    send_brand_email(
+        subject=f"You've joined {lead_name}'s team",
+        to=expert.email,
+        heading="You're on a new delivery team",
+        paragraphs=[
+            f"Hi {_first_name(expert)},",
+            f"{lead_name} has added you to their team at Ripple Innovation Labs. "
+            "They can now assign you work on the projects they run.",
+            "Nothing changes about the work you're already doing, or anything "
+            "you've already earned.",
+        ],
+        cta=("Open my work board", _link("/work")),
+    )
+    if previous_lead and previous_lead.id != new_lead.id:
+        send_brand_email(
+            subject=f"{expert.full_name or expert.email} joined another team",
+            to=previous_lead.email,
+            heading="An expert moved to another team",
+            paragraphs=[
+                f"Hi {_first_name(previous_lead)},",
+                f"{expert.full_name or expert.email} has been added to "
+                f"{lead_name}'s roster, so they no longer appear under your team.",
+                "Any project of yours they're already on is unaffected — they "
+                "stay on it, and anything they've earned is theirs.",
+            ],
+        )

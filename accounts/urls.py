@@ -18,6 +18,7 @@ urlpatterns = [
     path("users/business-developers", views.business_developers),
     path("users/<int:user_id>", views.update_expert),
     path("users/<int:user_id>/role", views.update_role),
+    path("users/<int:user_id>/roster", views.roster),
     # Profile: professional detail, CV, and identity verification
     path("profile/professional", views.my_professional_profile),
     path("profile/cv", views.my_cv),

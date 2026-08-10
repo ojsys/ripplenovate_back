@@ -1,4 +1,5 @@
 from django.contrib.auth.password_validation import validate_password
+from django.db.models import Q
 from rest_framework import serializers
 
 from catalog.serializers import ProductLineBriefSerializer
@@ -18,6 +19,31 @@ class UserSerializer(serializers.ModelSerializer):
     # admin-only screens ended up in every lead's menu. This is the only honest
     # signal the frontend has.
     is_admin = serializers.BooleanField(source="is_superuser", read_only=True)
+    # How much this expert already has on. `active_load` is a stored number a
+    # seed once wrote and nothing has maintained since, so it can't answer
+    # "can they take this on?" — this counts the live projects they're actually
+    # on. The old field stays for now so nothing reading it breaks.
+    active_projects = serializers.SerializerMethodField()
+    # Whether they're on the roster of whoever is asking. A lead staffs a brief
+    # from their own people first, but isn't limited to them — an expert can
+    # work across teams if they have the capacity.
+    on_my_roster = serializers.SerializerMethodField()
+
+    def get_active_projects(self, obj):
+        from projects.models import Project
+
+        if obj.role != User.Role.EXPERT:
+            return 0
+        return (Project.objects
+                .filter(Q(experts=obj) | Q(expert=obj),
+                        stage__in=[Project.Stage.PAID, Project.Stage.IN_PROGRESS,
+                                   Project.Stage.REVIEW])
+                .distinct()
+                .count())
+
+    def get_on_my_roster(self, obj):
+        viewer = self.context.get("viewer")
+        return bool(viewer and obj.lead_id == viewer.id)
 
     def get_onboarding_complete(self, obj):
         return obj.onboarding_completed_at is not None
@@ -29,6 +55,7 @@ class UserSerializer(serializers.ModelSerializer):
             "company", "specialty", "active_load", "skills", "product_lines",
             "is_email_verified", "initials",
             "approval_status", "is_approved", "needs_approval", "is_admin",
+            "active_projects", "on_my_roster",
             "onboarding_step", "onboarding_complete", "rejection_reason",
             "referral_code",
         ]
@@ -205,12 +232,42 @@ class InvitationCreateSerializer(serializers.Serializer):
     product_lines = serializers.ListField(child=serializers.SlugField(), required=False)
 
     def validate_email(self, value):
+        """An invitation creates an account, so it can't target one that exists.
+
+        The message says which case it is and what to do instead. "Someone with
+        this email already has an account" is true but leads nowhere — a lead
+        reading it can't tell whether the person is already theirs to assign,
+        works for another lead, or isn't an expert at all, and the natural
+        conclusion is that inviting again is the only way through.
+        """
         value = value.lower().strip()
-        if User.objects.filter(email__iexact=value).exists():
+        existing = User.objects.filter(email__iexact=value).first()
+        if not existing:
+            return value
+
+        who = existing.full_name or value
+        if existing.role != User.Role.EXPERT:
             raise serializers.ValidationError(
-                "Someone with this email already has an account."
+                f"{who} already has an account here as a "
+                f"{existing.get_role_display().lower()}, so they can't be invited "
+                "as an expert. An admin can change their role if that's wrong."
             )
-        return value
+        lead = existing.lead
+        if lead_id := self.context.get("lead_id"):
+            if lead and lead.id == lead_id:
+                raise serializers.ValidationError(
+                    f"{who} is already on your team — no invitation needed. "
+                    "Add them straight to a project from the assign screen."
+                )
+        if lead:
+            raise serializers.ValidationError(
+                f"{who} is already an expert on {lead.full_name or lead.email}'s "
+                "team. Ask an admin to move them across."
+            )
+        raise serializers.ValidationError(
+            f"{who} already has an expert account but isn't on anyone's team. "
+            "Ask an admin to add them to your roster."
+        )
 
 
 class InvitationAcceptSerializer(serializers.Serializer):

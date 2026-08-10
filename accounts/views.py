@@ -17,6 +17,7 @@ from catalog.models import ProductLine
 from .emails import (
     notify_admins_of_application,
     notify_admins_of_kyc,
+    notify_roster_changed,
     notify_lead_invitation_accepted,
     send_application_received,
     send_application_rejected,
@@ -252,8 +253,58 @@ def experts(request):
     line_slug = request.query_params.get("product_line")
     if line_slug:
         qs = qs.filter(product_lines__slug=line_slug)
+    qs = qs.select_related("lead").prefetch_related("product_lines").distinct()
     qs = qs.prefetch_related("product_lines").distinct().order_by("full_name")
-    return Response(UserSerializer(qs, many=True).data)
+    return Response(
+        UserSerializer(qs, many=True, context={"viewer": request.user}).data)
+
+
+@api_view(["POST", "DELETE"])
+@permission_classes([IsAuthenticated])
+def roster(request, user_id):
+    """Add an existing expert to your roster, or let them go.
+
+    An expert who already has an account can't be invited again — an invitation
+    creates one. Without this there was no other way to pick them up, so a lead
+    who'd worked with someone before the platform changed had no route back to
+    them, and re-inviting (the only obvious move) is exactly what's blocked.
+
+    Any delivery lead may do this, deliberately. Capacity is the real limit on
+    whether an expert can take work, not which lead first signed them up, and
+    `active_projects` on the picker is what answers that. Where someone is
+    already on another lead's roster this moves them — so that lead is told,
+    rather than finding out by noticing an absence.
+    """
+    _require_lead(request.user)
+    target = User.objects.filter(id=user_id, role=User.Role.EXPERT).first()
+    if not target:
+        return Response({"detail": "No expert with that id."},
+                        status=status.HTTP_404_NOT_FOUND)
+
+    if request.method == "DELETE":
+        if target.lead_id != request.user.id:
+            return Response({"detail": "They aren't on your roster."},
+                            status=status.HTTP_400_BAD_REQUEST)
+        target.lead = None
+        target.save(update_fields=["lead"])
+        return Response(
+            UserSerializer(target, context={"viewer": request.user}).data)
+
+    if target.lead_id == request.user.id:
+        return Response({"detail": f"{target.full_name or target.email} is "
+                                   "already on your team."},
+                        status=status.HTTP_400_BAD_REQUEST)
+
+    previous = target.lead
+    target.lead = request.user
+    target.save(update_fields=["lead"])
+    # An expert can only be assigned in a discipline they cover, so a roster
+    # move that leaves them coverless would be a dead end. Widen them into the
+    # lines their new lead runs, keeping whatever they already had.
+    target.product_lines.add(*request.user.product_lines.all())
+    notify_roster_changed(target, new_lead=request.user, previous_lead=previous)
+    return Response(
+        UserSerializer(target, context={"viewer": request.user}).data)
 
 
 @api_view(["GET"])
@@ -485,7 +536,8 @@ def invitations(request):
 
     if request.method == "POST":
         payload = request.data if isinstance(request.data, list) else [request.data]
-        serializer = InvitationCreateSerializer(data=payload, many=True)
+        serializer = InvitationCreateSerializer(
+            data=payload, many=True, context={"lead_id": request.user.id})
         serializer.is_valid(raise_exception=True)
 
         created, skipped = [], []
