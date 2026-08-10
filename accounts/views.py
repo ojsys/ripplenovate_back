@@ -415,8 +415,15 @@ def _readable_list(items):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def applications(request):
-    """The review queue — pending partner applications."""
-    if not request.user.is_superuser and request.user.role != User.Role.DELIVERY_LEAD:
+    """The review queue — pending partner applications. Admins only.
+
+    The check used to admit any delivery lead, which disagreed with its own
+    error message, with `decide_application` below, and with what the queue
+    contains: somebody else's application, including the CV and profile they
+    submitted to the platform rather than to a peer. Vetting a partner is an
+    admin's job, and a lead can't act on one of these anyway.
+    """
+    if not request.user.is_superuser:
         raise PermissionDenied("Only an admin can review applications.")
     qs = (User.objects
           .filter(approval_status=User.ApprovalStatus.PENDING)

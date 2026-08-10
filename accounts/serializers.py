@@ -13,6 +13,11 @@ class UserSerializer(serializers.ModelSerializer):
     is_approved = serializers.BooleanField(read_only=True)
     needs_approval = serializers.BooleanField(read_only=True)
     onboarding_complete = serializers.SerializerMethodField()
+    # Admins carry the delivery_lead role (see `create_superuser`), so `role`
+    # alone can't tell one apart from an ordinary lead — which is how
+    # admin-only screens ended up in every lead's menu. This is the only honest
+    # signal the frontend has.
+    is_admin = serializers.BooleanField(source="is_superuser", read_only=True)
 
     def get_onboarding_complete(self, obj):
         return obj.onboarding_completed_at is not None
@@ -23,7 +28,7 @@ class UserSerializer(serializers.ModelSerializer):
             "id", "email", "full_name", "role", "role_label",
             "company", "specialty", "active_load", "skills", "product_lines",
             "is_email_verified", "initials",
-            "approval_status", "is_approved", "needs_approval",
+            "approval_status", "is_approved", "needs_approval", "is_admin",
             "onboarding_step", "onboarding_complete", "rejection_reason",
             "referral_code",
         ]
