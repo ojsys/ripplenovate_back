@@ -34,10 +34,31 @@ def _project_url(project):
     return f"{_frontend()}/projects/{project.id}"
 
 
-def _lead_emails():
-    return list(
-        User.objects.filter(role=User.Role.DELIVERY_LEAD).values_list("email", flat=True)
-    )
+def _intake_lead_emails(project):
+    """The leads who could actually pick this brief up.
+
+    Was every delivery lead on the platform, which meant a lead in one
+    discipline was emailed about work they can't see, can't quote, and has no
+    stake in — and so was every lead still waiting to be approved. This mirrors
+    the intake queue in `access.visible_projects`: an unclaimed brief belongs to
+    the approved leads whose product lines cover it, and to nobody else.
+    """
+    if project.lead_id:
+        # Somebody owns it; there is no queue to notify.
+        return [project.lead.email] if project.lead else []
+    if not project.product_line_id:
+        return []
+    candidates = User.objects.filter(
+        role=User.Role.DELIVERY_LEAD,
+        is_active=True,
+        product_lines__id=project.product_line_id,
+    ).distinct()
+    return [lead.email for lead in candidates if lead.is_approved]
+
+
+def _project_lead_email(project):
+    """Just the lead running this project — a list so it composes with the rest."""
+    return [project.lead.email] if project.lead_id and project.lead else []
 
 
 def _team_emails(project):
@@ -65,7 +86,7 @@ def _client_name(project):
 def notify_project_submitted(project):
     send_brand_email(
         subject=f"New project brief: {project.title}",
-        to=_lead_emails(),
+        to=_intake_lead_emails(project),
         heading="A new project brief was submitted",
         paragraphs=[
             f"{_client_name(project)} ({project.company or '—'}) submitted “{project.title}”.",
@@ -105,7 +126,7 @@ def notify_payment_received(project):
     )
     send_brand_email(
         subject=f"Paid & ready to assign: {project.title}",
-        to=_lead_emails(),
+        to=_project_lead_email(project) or _intake_lead_emails(project),
         heading="A project is paid and ready to assign",
         paragraphs=[f"“{project.title}” ({project.company}) has been paid. Assign an expert to kick it off."],
         cta=("Assign an expert", _project_url(project)),
@@ -182,7 +203,7 @@ def notify_update_posted(project, activity):
     author_email = activity.author.email if activity.author else None
     recipients = {project.client.email}
     recipients.update(_team_emails(project))
-    recipients.update(_lead_emails())
+    recipients.update(_project_lead_email(project))
     recipients.discard(author_email)
     kind_label = activity.get_kind_display()
     send_brand_email(
@@ -236,7 +257,7 @@ def notify_project_completed(project, completed_by_client=True):
     When a lead closes it out instead of the client, the client is told too — they
     should never find a project completed without hearing why.
     """
-    recipients = set(_lead_emails())
+    recipients = set(_project_lead_email(project))
     recipients.update(_team_emails(project))
     who = (f"{_client_name(project)} approved delivery of"
            if completed_by_client else

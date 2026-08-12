@@ -1070,6 +1070,24 @@ def delete_attachment(request, attachment_id):
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
+def analytics(request):
+    """What the platform itself has earned. Admins and staff only.
+
+    Separate from `/api/reports` on purpose. Reports answer "how is my
+    discipline doing?" and are scoped to whoever asks; this is the business's
+    own books — every client, every line, and the margin on all of it — which
+    is not a delivery lead's to read.
+    """
+    if not (request.user.is_staff or request.user.is_superuser):
+        raise PermissionDenied("Analytics are for admins and staff.")
+
+    from . import analytics as analytics_service
+
+    return Response(analytics_service.dashboard())
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
 def reports(request):
     """Per-line P&L, the business-development leaderboard, and lead scorecards.
 

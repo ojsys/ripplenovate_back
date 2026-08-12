@@ -50,11 +50,18 @@ def send_brand_email(subject, to, heading, paragraphs, cta=None, fail_silently=T
     text_content = render_to_string("emails/brand_email.txt", context)
     html_content = render_to_string("emails/brand_email.html", context)
 
-    try:
-        msg = EmailMultiAlternatives(subject, text_content, settings.DEFAULT_FROM_EMAIL, recipients)
-        msg.attach_alternative(html_content, "text/html")
-        msg.send()
-    except Exception as exc:  # never let email break the request
-        logger.error("Email send failed (%s -> %s): %s", subject, recipients, exc)
-        if not fail_silently:
-            raise
+    # One message per recipient, never one message addressed to all of them.
+    # A shared To: header shows every client, expert and lead each other's
+    # address — a disclosure nobody agreed to, and the kind that can't be taken
+    # back once sent. One failure doesn't stop the rest.
+    for recipient in recipients:
+        try:
+            msg = EmailMultiAlternatives(
+                subject, text_content, settings.DEFAULT_FROM_EMAIL, [recipient]
+            )
+            msg.attach_alternative(html_content, "text/html")
+            msg.send()
+        except Exception as exc:  # never let email break the request
+            logger.error("Email send failed (%s -> %s): %s", subject, recipient, exc)
+            if not fail_silently:
+                raise

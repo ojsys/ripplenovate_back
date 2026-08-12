@@ -19,6 +19,9 @@ class UserSerializer(serializers.ModelSerializer):
     # admin-only screens ended up in every lead's menu. This is the only honest
     # signal the frontend has.
     is_admin = serializers.BooleanField(source="is_superuser", read_only=True)
+    # Staff see the platform's own books. Superusers are staff too, so this
+    # is the single gate for the analytics screen.
+    is_staff = serializers.BooleanField(read_only=True)
     # How much this expert already has on. `active_load` is a stored number a
     # seed once wrote and nothing has maintained since, so it can't answer
     # "can they take this on?" — this counts the live projects they're actually
@@ -55,7 +58,7 @@ class UserSerializer(serializers.ModelSerializer):
             "company", "specialty", "active_load", "skills", "product_lines",
             "is_email_verified", "initials",
             "approval_status", "is_approved", "needs_approval", "is_admin",
-            "active_projects", "on_my_roster",
+            "is_staff", "active_projects", "on_my_roster",
             "onboarding_step", "onboarding_complete", "rejection_reason",
             "referral_code",
         ]

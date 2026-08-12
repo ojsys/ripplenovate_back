@@ -10,6 +10,7 @@ urlpatterns = [
     path("projects/stats/admin", views.admin_stats),
     path("pipeline", views.pipeline),
     path("reports", views.reports),
+    path("analytics", views.analytics),
     path("tasks/<int:task_id>", views.task_detail),
     path("tasks/<int:task_id>/submit", views.submit_task),
     path("tasks/<int:task_id>/approve", views.approve_task),

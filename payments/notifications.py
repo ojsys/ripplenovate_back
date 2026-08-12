@@ -36,12 +36,27 @@ def _usd(amount):
     return "${:,.2f}".format(amount or 0)
 
 
-def _lead_emails(exclude=None):
+def _settler_emails(withdrawal):
+    """Who needs to know a payout is waiting.
+
+    Was every delivery lead on the platform, so one expert's request landed in
+    the inbox of leads who had never worked with them — the request itself
+    tells you what somebody earns, which isn't general information.
+
+    Now: the admins who run payouts, plus the requester's own delivery lead if
+    they have one. Any approved lead can still settle a request from the payout
+    queue on the earnings page; this is about who gets told, not who may act.
+    """
     emails = set(
-        User.objects.filter(role=User.Role.DELIVERY_LEAD).values_list("email", flat=True)
+        User.objects.filter(is_superuser=True, is_active=True)
+        .values_list("email", flat=True)
     )
-    emails.discard(exclude)
-    return list(emails)
+    own_lead = withdrawal.user.lead
+    if own_lead and own_lead.role == User.Role.DELIVERY_LEAD:
+        emails.add(own_lead.email)
+    # Nobody settles their own request, so nobody needs telling about it twice.
+    emails.discard(withdrawal.user.email)
+    return sorted(emails)
 
 
 def _first_name(user):
@@ -103,7 +118,7 @@ def notify_withdrawal_requested(withdrawal):
         ],
         cta=("Track this payout", _earnings_url()),
     )
-    recipients = _lead_emails(exclude=withdrawal.user.email)
+    recipients = _settler_emails(withdrawal)
     if recipients:
         send_brand_email(
             subject=f"Payout request: {_usd(withdrawal.amount_usd)}",

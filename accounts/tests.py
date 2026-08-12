@@ -260,15 +260,28 @@ class InvitationTests(TestCase):
             list(Invitation.objects.get(email="invitee@ril.dev").product_lines.all()),
             [self.line])
 
-    def test_inviting_an_existing_account_is_refused(self):
-        User.objects.create_user("taken@ril.dev", "x", role=User.Role.EXPERT)
+    def test_inviting_an_existing_expert_adds_them_to_the_team(self):
+        """Was refused, which sent leads looking for an admin. An invitation
+        creates an account and theirs exists, so they just join instead —
+        see accounts/test_invitations.py for the full set of cases."""
+        taken = User.objects.create_user("taken@ril.dev", "x", role=User.Role.EXPERT)
         response = self.invite({"email": "taken@ril.dev"})
-        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.status_code, 201)
+        taken.refresh_from_db()
+        self.assertEqual(taken.lead_id, self.lead.id)
+
+    def test_inviting_a_non_expert_account_is_still_refused(self):
+        User.objects.create_user("buyer@acme.io", "x", role=User.Role.CLIENT)
+        self.assertEqual(self.invite({"email": "buyer@acme.io"}).status_code, 400)
 
     def test_a_duplicate_pending_invitation_is_skipped_not_duplicated(self):
         self.invite()
         response = self.invite()
-        self.assertEqual(response.data["skipped"], ["invitee@ril.dev"])
+        # Each skip carries its reason — "already invited" and "already on your
+        # team" are different situations and the lead needs to tell them apart.
+        self.assertEqual(response.data["skipped"],
+                         [{"email": "invitee@ril.dev",
+                           "reason": "already invited and waiting"}])
         self.assertEqual(Invitation.objects.filter(email="invitee@ril.dev").count(), 1)
 
     def test_accepting_creates_an_expert_on_the_leads_roster(self):
