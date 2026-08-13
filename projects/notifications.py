@@ -386,3 +386,106 @@ def notify_task_changes_requested(task, note):
         ],
         cta=("Open the project", _project_url(project)),
     )
+
+
+@_safe
+def notify_task_edited(task, summary):
+    """Tell whoever holds a task that its terms changed.
+
+    Only them. What a task pays is between the platform and the person doing
+    it, and the client already sees the change in the project's activity feed.
+    """
+    if not task.assignee:
+        return
+    send_brand_email(
+        subject=f"Your task changed: {task.title}",
+        to=task.assignee.email,
+        heading="A task you're holding was updated",
+        paragraphs=[
+            f"Hi {task.assignee.full_name or 'there'},",
+            f"Your delivery lead updated a task on “{task.project.title}”:",
+            summary,
+            "Open the project to see where it stands now.",
+        ],
+        cta=("Open the project", _project_url(task.project)),
+    )
+
+
+@_safe
+def notify_task_reassigned(task, previous, current, note=""):
+    """Tell both people. Losing work and gaining it are equally worth knowing.
+
+    Addressed separately rather than as a pair — the two need to read different
+    things, and neither needs the other's address.
+    """
+    project = task.project
+    worth = (f" It's worth {_money2(task.amount_usd)} on approval."
+             if task.amount_usd > 0 else "")
+    tail = [f"Your delivery lead's note: “{note}”"] if note else []
+
+    if current:
+        send_brand_email(
+            subject=f"A task moved to you: {task.title}",
+            to=current.email,
+            heading="You've picked up a task",
+            paragraphs=[
+                f"Hi {current.full_name or 'there'},",
+                f"“{task.title}” on “{project.title}” is yours now.{worth}",
+                *tail,
+                "Submit it for review when it's done.",
+            ],
+            cta=("Open the project", _project_url(project)),
+        )
+    if previous:
+        moved_to = ((current.full_name or current.email) if current
+                    else "nobody for the moment")
+        send_brand_email(
+            subject=f"A task moved off your list: {task.title}",
+            to=previous.email,
+            heading="A task is no longer yours",
+            paragraphs=[
+                f"Hi {previous.full_name or 'there'},",
+                f"“{task.title}” on “{project.title}” has been reassigned to "
+                f"{moved_to}, so it's off your board.",
+                *tail,
+                "Anything you've already been approved and paid for is unaffected.",
+            ],
+            cta=("Open the project", _project_url(project)),
+        )
+
+
+@_safe
+def notify_task_removed(project, title, assignee, reason, amount=0):
+    """A task taken off the list — the client and whoever held it both hear why.
+
+    The client because it changes what's being delivered; the expert because it
+    takes work, and possibly money, off them. The amount goes only to the
+    expert.
+    """
+    if assignee:
+        worth = (f" It would have paid {_money2(amount)} on approval."
+                 if amount and amount > 0 else "")
+        send_brand_email(
+            subject=f"A task was removed: {title}",
+            to=assignee.email,
+            heading="A task was taken off your list",
+            paragraphs=[
+                f"Hi {assignee.full_name or 'there'},",
+                f"“{title}” on “{project.title}” has been removed.{worth}",
+                f"Your delivery lead's reason: “{reason}”",
+                "If that doesn't look right, reply to this email and we'll look into it.",
+            ],
+            cta=("Open the project", _project_url(project)),
+        )
+    send_brand_email(
+        subject=f"Scope changed on {project.title}",
+        to=project.client.email,
+        heading="A piece of work was removed",
+        paragraphs=[
+            f"Hi {project.client.full_name or 'there'},",
+            f"“{title}” has been removed from the plan for “{project.title}”.",
+            f"The delivery lead's reason: “{reason}”",
+            "Your quote is unchanged. Get in touch if this isn't what you expected.",
+        ],
+        cta=("View the project", _project_url(project)),
+    )

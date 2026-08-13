@@ -36,6 +36,8 @@ from .serializers import (
     ProjectEditSerializer,
     ProjectListSerializer,
     QuoteSerializer,
+    TaskEditSerializer,
+    TaskReassignSerializer,
     TaskSerializer,
     TaskWriteSerializer,
 )
@@ -752,25 +754,141 @@ def task_detail(request, task_id):
     return _update_task(request, task_id)
 
 
+TASK_FIELD_LABELS = {
+    "title": "title",
+    "description": "brief",
+    "order": "position",
+}
+
+
+def describe_task_edit(task, changes):
+    """One readable sentence for what a lead changed about a task.
+
+    Task edits used to be silent — no feed entry, no email. The person doing
+    the work could find their task retitled, re-scoped or re-priced and learn
+    about it only by looking. What a task is worth and what it asks for is the
+    deal between the platform and the expert; changing it without saying so
+    isn't a change, it's a surprise.
+    """
+    parts = []
+    if "amount_usd" in changes:
+        old, new = changes["amount_usd"]
+        parts.append(f"changed what it pays from ${old:,.2f} to ${new:,.2f}")
+    for field, label in TASK_FIELD_LABELS.items():
+        if field not in changes:
+            continue
+        old, new = changes[field]
+        if field == "description":
+            parts.append("revised the brief")
+        elif field == "order":
+            continue  # reordering isn't news
+        else:
+            parts.append(f"changed the {label} from “{old}” to “{new}”")
+    if not parts:
+        return ""
+    detail = parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + f" and {parts[-1]}"
+    return f"Edited “{task.title}” — {detail}."
+
+
 def _update_task(request, task_id):
-    """Retitle, re-price, or reassign a task that hasn't been handed in yet."""
+    """Retitle, re-scope or re-price a task that hasn't been handed in yet.
+
+    Who holds it moves through `reassign_task` instead.
+    """
     task = _writable_task(request, task_id)
     project = task.project
     _check_project_open(project)
     _check_task_writable(task)
 
-    serializer = TaskWriteSerializer(task, data=request.data, partial=True)
+    serializer = TaskEditSerializer(task, data=request.data, partial=True)
     serializer.is_valid(raise_exception=True)
     updates = serializer.validated_data
 
-    if "assignee" in updates:
-        _check_assignee(project, updates["assignee"])
     if "amount_usd" in updates:
         _check_allocation(project, updates["amount_usd"], replacing=task.amount_usd)
 
-    for field, value in updates.items():
-        setattr(task, field, value)
-    task.save(update_fields=list(updates) or None)
+    # Diff before saving so the feed entry can name what actually changed, and
+    # so an edit that changes nothing stays silent.
+    changes = {
+        field: (getattr(task, field), value)
+        for field, value in updates.items()
+        if getattr(task, field) != value
+    }
+    if not changes:
+        return Response(TaskSerializer(task).data)
+
+    for field, (_old, new) in changes.items():
+        setattr(task, field, new)
+    task.save(update_fields=list(changes))
+
+    summary = describe_task_edit(task, changes)
+    if summary:
+        log_activity(project, request.user, summary)
+        notifications.notify_task_edited(task, summary)
+    return Response(TaskSerializer(task).data)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def reassign_task(request, task_id):
+    """Move a task to someone else on the team, or take it off everyone.
+
+    Allowed on work already handed in, unlike re-pricing: an expert going quiet
+    mid-review is exactly when a lead needs to move the work, and refusing
+    would leave the task stuck with the one person who can't finish it. A
+    submitted task goes back to "to do" on the way, because the submission
+    belonged to whoever made it — the new holder hasn't handed anything in.
+
+    An approved task doesn't move. It's paid, and the ledger records who was
+    paid for it.
+    """
+    task = _task_or_404(task_id)
+    if not task:
+        raise Http404
+    project = task.project
+    if not leads_project(request.user, project):
+        raise PermissionDenied("Only the delivery lead running this project can move a task.")
+    _check_project_open(project)
+    if task.status == Task.Status.APPROVED:
+        raise ValidationError(
+            "This task is approved and paid — it stays with the person who did it."
+        )
+
+    serializer = TaskReassignSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    raw = serializer.validated_data.get("assignee")
+    note = (serializer.validated_data.get("note") or "").strip()
+
+    new_assignee = None
+    if raw is not None:
+        new_assignee = User.objects.filter(id=raw, role=Role.EXPERT).first()
+        if not new_assignee:
+            raise ValidationError("Select a valid expert.")
+        _check_assignee(project, new_assignee)
+
+    previous = task.assignee
+    if previous == new_assignee:
+        return Response(TaskSerializer(task).data)
+
+    task.assignee = new_assignee
+    fields = ["assignee"]
+    if task.status == Task.Status.SUBMITTED:
+        task.status = Task.Status.TODO
+        task.submitted_at = None
+        fields += ["status", "submitted_at"]
+    task.save(update_fields=fields)
+
+    who = lambda u: (u.full_name or u.email) if u else None
+    if new_assignee and previous:
+        text = f"Moved “{task.title}” from {who(previous)} to {who(new_assignee)}."
+    elif new_assignee:
+        text = f"Assigned “{task.title}” to {who(new_assignee)}."
+    else:
+        text = f"Unassigned “{task.title}” — it was {who(previous)}'s."
+    if note:
+        text += f" {note}"
+    log_activity(project, request.user, text)
+    notifications.notify_task_reassigned(task, previous, new_assignee, note)
     return Response(TaskSerializer(task).data)
 
 
@@ -901,11 +1019,15 @@ def request_task_changes(request, task_id):
 
 
 def _delete_task(request, task_id):
-    """Drop a task from the list.
+    """Drop a task from the list — with a reason, on the record.
 
-    Refused once it has been paid — an earning protects its task at the
-    database level, and answering with a clear reason beats a 500 from the
-    ProtectedError underneath.
+    Refused once it has been paid: an earning protects its task at the database
+    level, and answering with a clear reason beats a 500 from the ProtectedError
+    underneath.
+
+    The reason isn't optional. Removing a task changes what the client is
+    getting and takes work — and money — off the person holding it. Both of
+    them are owed an account of why, and the feed is where it lives afterwards.
     """
     task = _writable_task(request, task_id)
     if task.earnings.exists():
@@ -913,7 +1035,22 @@ def _delete_task(request, task_id):
             "This task has been paid, so it stays on the record. "
             "Its amount is part of what the project has already paid out."
         )
+    reason = (request.data.get("reason") or "").strip()
+    if not reason:
+        raise ValidationError(
+            "Say why this task is being removed — the client and whoever holds "
+            "it are told, and the reason goes on the project record."
+        )
+
+    project, title, assignee = task.project, task.title, task.assignee
+    amount = task.amount_usd
     task.delete()
+
+    text = f"Removed “{title}” from the task list — {reason}"
+    if amount > 0:
+        text = (f"Removed “{title}” (${amount:,.2f}) from the task list — {reason}")
+    log_activity(project, request.user, text)
+    notifications.notify_task_removed(project, title, assignee, reason, amount)
     return Response(status=status.HTTP_204_NO_CONTENT)
 
 

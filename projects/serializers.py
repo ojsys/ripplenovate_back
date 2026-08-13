@@ -32,7 +32,7 @@ class TaskSerializer(serializers.ModelSerializer):
 
 
 class TaskWriteSerializer(serializers.ModelSerializer):
-    """A delivery lead creating or editing a task.
+    """A delivery lead creating a task.
 
     `status` is absent on purpose. It moves through the lifecycle actions —
     submit, approve, request changes — which check who is asking and release
@@ -58,6 +58,29 @@ class TaskWriteSerializer(serializers.ModelSerializer):
         if value and value.role != value.Role.EXPERT:
             raise serializers.ValidationError("Tasks are assigned to experts.")
         return value
+
+
+class TaskEditSerializer(TaskWriteSerializer):
+    """Editing an existing task. Everything except who holds it.
+
+    Moving a task between people is its own action: it has different rules —
+    it's allowed on work already handed in, where re-pricing isn't — and it owes
+    two people an explanation rather than one. Leaving `assignee` here as well
+    would give it two doors with two sets of rules.
+    """
+
+    class Meta(TaskWriteSerializer.Meta):
+        fields = ["title", "description", "amount_usd", "order"]
+
+
+class TaskReassignSerializer(serializers.Serializer):
+    """Hand a task to someone else on the team, or take it off everyone."""
+
+    assignee = serializers.IntegerField(
+        required=False, allow_null=True,
+        help_text="An expert on this project's team, or null to unassign.",
+    )
+    note = serializers.CharField(required=False, allow_blank=True)
 
 
 class AttachmentSerializer(serializers.ModelSerializer):

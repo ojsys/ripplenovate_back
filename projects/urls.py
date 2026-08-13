@@ -12,6 +12,7 @@ urlpatterns = [
     path("reports", views.reports),
     path("analytics", views.analytics),
     path("tasks/<int:task_id>", views.task_detail),
+    path("tasks/<int:task_id>/reassign", views.reassign_task),
     path("tasks/<int:task_id>/submit", views.submit_task),
     path("tasks/<int:task_id>/approve", views.approve_task),
     path("tasks/<int:task_id>/request-changes", views.request_task_changes),

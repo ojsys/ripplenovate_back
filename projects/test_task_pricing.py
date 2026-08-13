@@ -58,6 +58,10 @@ class TaskPricingTests(TestCase):
         return as_user(user or self.lead).post(
             f"/api/projects/{self.project.id}/tasks", payload, format="json")
 
+    def reassign(self, task, to=None, user=None):
+        return as_user(user or self.lead).post(
+            f"/api/tasks/{task.id}/reassign", {"assignee": to}, format="json")
+
     def edit(self, task, user=None, **payload):
         return as_user(user or self.lead).patch(
             f"/api/tasks/{task.id}", payload, format="json")
@@ -155,14 +159,23 @@ class TaskPricingTests(TestCase):
 
     def test_reassigning_to_someone_off_the_team_is_refused(self):
         task = Task.objects.get(id=self.create(title="Mine").data["id"])
-        self.assertEqual(self.edit(task, assignee=self.bench.id).status_code, 400)
+        self.assertEqual(self.reassign(task, self.bench.id).status_code, 400)
 
     def test_a_task_can_move_between_team_members(self):
         task = Task.objects.get(id=self.create(
             title="Handover", assignee=self.ada.id, amount_usd="500.00").data["id"])
-        self.assertEqual(self.edit(task, assignee=self.chidi.id).status_code, 200)
+        self.assertEqual(self.reassign(task, self.chidi.id).status_code, 200)
         task.refresh_from_db()
         self.assertEqual(task.assignee_id, self.chidi.id)
+
+    def test_the_edit_endpoint_no_longer_moves_work(self):
+        """Reassignment lives at /reassign, where it can also move a task that
+        has already been handed in — and where it tells both people."""
+        task = Task.objects.get(id=self.create(
+            title="Stays put", assignee=self.ada.id).data["id"])
+        self.edit(task, assignee=self.chidi.id)
+        task.refresh_from_db()
+        self.assertEqual(task.assignee_id, self.ada.id)
 
     # --- when the list is closed ---
     def test_tasks_cannot_be_priced_before_the_client_pays(self):
@@ -193,9 +206,10 @@ class TaskPricingTests(TestCase):
         self.assertEqual(self.edit(task, title="Rewritten").status_code, 400)
 
     # --- deleting ---
-    def test_a_lead_deletes_an_unpaid_task(self):
+    def test_a_lead_deletes_an_unpaid_task_with_a_reason(self):
         task = Task.objects.get(id=self.create(title="Scrap this").data["id"])
-        response = as_user(self.lead).delete(f"/api/tasks/{task.id}")
+        response = as_user(self.lead).delete(
+            f"/api/tasks/{task.id}", {"reason": "Out of scope"}, format="json")
         self.assertEqual(response.status_code, 204)
         self.assertFalse(Task.objects.filter(id=task.id).exists())
 
