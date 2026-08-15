@@ -534,6 +534,43 @@ class EmailToken(models.Model):
         self.save(update_fields=["used_at"])
 
 
+class ImpersonationEvent(models.Model):
+    """A record that an admin signed in as somebody else.
+
+    Impersonation makes one person's actions indistinguishable from another's,
+    which is exactly what makes it useful for support and exactly what makes it
+    dangerous. The row is written before the token is handed over, so a session
+    cannot happen without a trace of who opened it, against whom, and from
+    where — and `ended_at` says whether they stepped back out or just let it
+    lapse.
+    """
+
+    impersonator = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name="impersonations_started",
+        help_text="The admin who started the session.",
+    )
+    target = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name="impersonations_received",
+        help_text="The account they signed in as.",
+    )
+    reason = models.CharField(
+        max_length=200, blank=True,
+        help_text="What the admin said they were doing.",
+    )
+    started_at = models.DateTimeField(auto_now_add=True)
+    # Set when they hand the session back. Null means it was abandoned rather
+    # than closed — the token simply expired.
+    ended_at = models.DateTimeField(null=True, blank=True)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    user_agent = models.CharField(max_length=300, blank=True)
+
+    class Meta:
+        ordering = ["-started_at"]
+
+    def __str__(self):
+        return f"{self.impersonator_id} as {self.target_id} at {self.started_at}"
+
+
 class SiteSettings(models.Model):
     """Editable site-wide branding — a single row managed in the Django admin."""
 

@@ -6,6 +6,7 @@ from django.utils import timezone
 
 from .models import (
     EmailToken,
+    ImpersonationEvent,
     Invitation,
     KycProfile,
     ProfessionalProfile,
@@ -106,6 +107,27 @@ class UserAdmin(BaseUserAdmin):
 class EmailTokenAdmin(admin.ModelAdmin):
     list_display = ("token", "user", "purpose", "created_at", "used_at")
     list_filter = ("purpose",)
+
+
+@admin.register(ImpersonationEvent)
+class ImpersonationEventAdmin(admin.ModelAdmin):
+    """Read-only on purpose. An audit trail an admin can edit isn't one."""
+
+    list_display = ("started_at", "impersonator", "target", "ended_at",
+                    "ip_address", "reason")
+    list_filter = ("started_at",)
+    search_fields = ("impersonator__email", "target__email", "reason")
+    readonly_fields = ("impersonator", "target", "reason", "started_at",
+                       "ended_at", "ip_address", "user_agent")
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 @admin.register(SiteSettings)

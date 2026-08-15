@@ -32,8 +32,10 @@ from .emails import (
     send_verification_email,
     send_welcome_client,
 )
+from . import impersonation
 from .models import (
     EmailToken,
+    ImpersonationEvent,
     Invitation,
     KycProfile,
     ProfessionalProfile,
@@ -81,6 +83,33 @@ def _require_lead(user, approved=True):
 def tokens_for(user):
     refresh = RefreshToken.for_user(user)
     return {"access": str(refresh.access_token), "refresh": str(refresh)}
+
+
+def _require_admin(user):
+    """Gate an action to a superuser.
+
+    `is_staff` is deliberately not enough. Staff see the platform's books;
+    signing in as another person is a different order of power.
+    """
+    if not user.is_superuser:
+        raise PermissionDenied("Only an administrator can do that.")
+
+
+def me_payload(request):
+    """The signed-in user, plus who is really driving if it isn't them.
+
+    The frontend needs `impersonated_by` on every read of `/auth/me`, not just
+    on the response that starts the session — a page reload must still put the
+    banner back, or an admin can forget whose account they're in.
+    """
+    data = UserSerializer(request.user, context={"viewer": request.user}).data
+    admin_id = impersonation.impersonator_id(request)
+    admin = User.objects.filter(id=admin_id).first() if admin_id else None
+    data["impersonated_by"] = (
+        {"id": admin.id, "email": admin.email, "full_name": admin.full_name}
+        if admin else None
+    )
+    return data
 
 
 @api_view(["GET"])
@@ -204,13 +233,17 @@ def me(request):
         serializer = ProfileUpdateSerializer(request.user, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save()
-    return Response(UserSerializer(request.user).data)
+    return Response(me_payload(request))
 
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def change_password(request):
     """Change the signed-in user's password (requires the current one)."""
+    # Knowing the old password is the check that this is really them — an
+    # admin borrowing the account doesn't know it, and shouldn't be able to set
+    # a new one and lock the owner out.
+    impersonation.forbid_while_impersonating(request, "Changing a password")
     serializer = ChangePasswordSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
     if not request.user.check_password(serializer.validated_data["old_password"]):
@@ -219,6 +252,137 @@ def change_password(request):
     request.user.set_password(serializer.validated_data["new_password"])
     request.user.save(update_fields=["password"])
     return Response({"detail": "Password updated."})
+
+
+def _client_ip(request):
+    """Best effort. Behind a proxy the left-most XFF entry is the caller."""
+    forwarded = request.META.get("HTTP_X_FORWARDED_FOR", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip() or None
+    return request.META.get("REMOTE_ADDR") or None
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def user_directory(request):
+    """Everyone on the platform, for an admin to search. `?q=` by name or email.
+
+    Deliberately admin-only and deliberately not paginated by role: the point
+    is to find one specific person whose account you need to stand in, and you
+    usually only know a fragment of their email.
+    """
+    _require_admin(request.user)
+    qs = User.objects.all()
+    term = (request.query_params.get("q") or "").strip()
+    if term:
+        qs = qs.filter(Q(email__icontains=term) | Q(full_name__icontains=term))
+    role = request.query_params.get("role")
+    if role:
+        qs = qs.filter(role=role)
+    qs = qs.prefetch_related("product_lines").order_by("full_name", "email")[:50]
+    return Response(
+        UserSerializer(qs, many=True, context={"viewer": request.user}).data)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def impersonate(request, user_id):
+    """Sign in as another user. Superusers only.
+
+    Returns a token pair for the target that still remembers who opened it, so
+    `/impersonation/stop` can hand the admin back their own session without
+    anyone having to stash the original tokens client-side — a copy of an
+    admin's credentials sitting in localStorage would be a worse problem than
+    the one this solves.
+    """
+    _require_admin(request.user)
+    target = User.objects.filter(id=user_id).first()
+    if not target:
+        return Response({"detail": "No user with that id."},
+                        status=status.HTTP_404_NOT_FOUND)
+    if target.id == request.user.id:
+        return Response({"detail": "You're already signed in as yourself."},
+                        status=status.HTTP_400_BAD_REQUEST)
+    # Nesting would make "who is really doing this?" a chain to unwind, and the
+    # `imp` claim only has room for one answer. Step out first.
+    if impersonation.is_impersonated(request):
+        return Response(
+            {"detail": "Stop impersonating before signing in as somebody else."},
+            status=status.HTTP_400_BAD_REQUEST)
+
+    # Written before the token exists, so there is no window in which a session
+    # is live but unlogged.
+    event = ImpersonationEvent.objects.create(
+        impersonator=request.user,
+        target=target,
+        reason=(request.data.get("reason") or "").strip()[:200],
+        ip_address=_client_ip(request),
+        user_agent=request.META.get("HTTP_USER_AGENT", "")[:300],
+    )
+    tokens = impersonation.tokens_for_impersonation(request.user, target, event.id)
+    data = UserSerializer(target, context={"viewer": target}).data
+    data["impersonated_by"] = {
+        "id": request.user.id,
+        "email": request.user.email,
+        "full_name": request.user.full_name,
+    }
+    return Response({**tokens, "user": data})
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def stop_impersonating(request):
+    """Hand the session back and become yourself again.
+
+    The admin's identity comes from the token's own claim, not from anything
+    the caller sends — so this can only ever return you to the account that
+    started the session.
+    """
+    admin_id = impersonation.impersonator_id(request)
+    if not admin_id:
+        return Response({"detail": "You aren't impersonating anyone."},
+                        status=status.HTTP_400_BAD_REQUEST)
+    admin = User.objects.filter(id=admin_id, is_superuser=True).first()
+    if not admin:
+        # Their admin rights were removed mid-session. There is nothing safe to
+        # return to, so the session simply ends.
+        return Response(
+            {"detail": "That admin account is no longer available. Please sign in again."},
+            status=status.HTTP_403_FORBIDDEN)
+
+    event = ImpersonationEvent.objects.filter(
+        id=impersonation.event_id(request), ended_at__isnull=True).first()
+    if event:
+        event.ended_at = timezone.now()
+        event.save(update_fields=["ended_at"])
+    return Response({**tokens_for(admin),
+                     "user": UserSerializer(admin, context={"viewer": admin}).data})
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def impersonation_log(request):
+    """Who has been signed in as whom. Admin-only.
+
+    An audit trail nobody can read is just a table, so this is the screen that
+    makes the logging worth doing.
+    """
+    _require_admin(request.user)
+    events = (ImpersonationEvent.objects
+              .select_related("impersonator", "target")[:200])
+    return Response([
+        {
+            "id": e.id,
+            "impersonator": e.impersonator.full_name or e.impersonator.email,
+            "target": e.target.full_name or e.target.email,
+            "target_role": e.target.role_label,
+            "reason": e.reason,
+            "started_at": e.started_at,
+            "ended_at": e.ended_at,
+            "ip_address": e.ip_address,
+        }
+        for e in events
+    ])
 
 
 @api_view(["GET", "POST"])

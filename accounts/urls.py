@@ -14,6 +14,12 @@ urlpatterns = [
     path("auth/password-reset/confirm", views.password_reset_confirm),
     path("auth/me", views.me),
     path("auth/change-password", views.change_password),
+    # Impersonation — an admin standing in a user's shoes. `users` is the
+    # directory they pick from; the log is what keeps it accountable.
+    path("users", views.user_directory),
+    path("users/<int:user_id>/impersonate", views.impersonate),
+    path("impersonation/stop", views.stop_impersonating),
+    path("impersonation/log", views.impersonation_log),
     path("users/experts", views.experts),
     path("users/business-developers", views.business_developers),
     path("users/<int:user_id>", views.update_expert),

@@ -11,6 +11,7 @@ from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+from accounts import impersonation
 from projects.access import can_access_project
 from projects.models import Project
 
@@ -181,6 +182,11 @@ def payout_account(request):
     """The signed-in earner's own bank account — read and update, nobody else's."""
     _require_earner_role(request.user)
     if request.method == "PUT":
+        # Repointing where somebody's money lands, from inside their account,
+        # is indistinguishable from them doing it. Reading it is fine — that's
+        # most of what support needs.
+        impersonation.forbid_while_impersonating(
+            request, "Changing a payout account")
         serializer = PayoutAccountSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
@@ -236,6 +242,7 @@ def resolve_account(request):
 def create_withdrawal(request):
     """An expert or delivery lead withdraws part of their available balance."""
     _require_earner(request.user)
+    impersonation.forbid_while_impersonating(request, "Requesting a withdrawal")
     serializer = WithdrawalCreateSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
     try:
