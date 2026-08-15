@@ -369,9 +369,14 @@ class ProjectViewSet(mixins.ListModelMixin,
     def _resolve_experts(self, project, expert_ids):
         """Turn ids into experts who may actually take this brief.
 
-        An expert can only work in a discipline they cover. The picker already
-        filters to those, so this is the server-side backstop — and it now runs
-        per person rather than once, because a team is only as valid as its
+        Someone from outside your roster has to cover the brief's discipline —
+        you haven't vouched for them, so their product lines are all there is
+        to judge by. Your own people you have vouched for, and that outranks
+        the tag: it was copied from whichever lead signed them up, nobody
+        curates it, and no lead can edit it, so enforcing it against your own
+        roster only ever said "no" to a team you picked yourself.
+
+        Runs per person rather than once — a team is only as valid as its
         least suitable member.
         """
         experts = []
@@ -380,12 +385,13 @@ class ProjectViewSet(mixins.ListModelMixin,
             if not expert:
                 raise ValidationError("Select a valid expert.")
             if (project.product_line_id
+                    and expert.lead_id != self.request.user.id
                     and not expert.product_lines
                                  .filter(id=project.product_line_id).exists()):
                 raise ValidationError(
                     f"{expert.full_name or expert.email} doesn't work in "
-                    f"{project.product_line.name}. Add that product line to their "
-                    "profile first, or pick someone else."
+                    f"{project.product_line.name} and isn't on your team. Add "
+                    "them to your team first, or pick someone else."
                 )
             experts.append(expert)
         return experts

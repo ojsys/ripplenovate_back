@@ -89,6 +89,28 @@ class TeamTests(TestCase):
         self.assertEqual(self.project.experts.count(), 0)
         self.assertEqual(self.project.stage, Project.Stage.PAID, "delivery started anyway")
 
+    def test_your_own_roster_is_not_held_to_the_discipline_tag(self):
+        """Vouching for them outranks a tag nobody curates.
+
+        The tag is copied from whichever lead signed the expert up, and no lead
+        can edit it — so a lead whose own lines don't match the brief could not
+        staff their own team on it by any route in the product.
+        """
+        self.outsider.lead = self.lead
+        self.outsider.save(update_fields=["lead"])
+        response = self.assign(experts=[self.outsider.id])
+        self.assertEqual(response.status_code, 200, response.data)
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.expert_id, self.outsider.id)
+
+    def test_another_leads_expert_is_still_held_to_it(self):
+        """Past your own roster the tag is the only thing there is to go on."""
+        other_lead = User.objects.create_user(
+            "otherteamlead@ril.team", "x", role=User.Role.DELIVERY_LEAD)
+        self.outsider.lead = other_lead
+        self.outsider.save(update_fields=["lead"])
+        self.assertEqual(self.assign(experts=[self.outsider.id]).status_code, 400)
+
     def test_assigning_nobody_is_refused(self):
         self.assertEqual(self.assign(experts=[]).status_code, 400)
 

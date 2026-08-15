@@ -156,6 +156,32 @@ class ExpertPickerTests(TestCase):
         names = {d["full_name"] for d in self.picker(product_line=self.line.slug)}
         self.assertNotIn(self.elsewhere.full_name, names)
 
+    def test_your_own_team_shows_whatever_they_are_tagged_with(self):
+        """The tag records which lead signed them up, not what they can do.
+
+        Filtering your roster on it emptied "Your team" without a word: a lead
+        whose own lines don't match the brief saw nothing but other people's
+        experts, and had no route back to their own.
+        """
+        self.mine.product_lines.set(
+            [ProductLine.objects.get(slug="software-web")])
+        names = {d["full_name"] for d in self.picker(product_line=self.line.slug)}
+        self.assertIn("Mine", names)
+
+    def test_a_lead_with_no_lines_of_their_own_still_sees_their_team(self):
+        """The case from production: the lead, their expert and the brief all
+        sat in different disciplines."""
+        self.lead.product_lines.clear()
+        self.mine.product_lines.clear()
+        picked = self.picker(product_line=self.line.slug)
+        self.assertIn("Mine", {d["full_name"] for d in picked})
+
+    def test_nobody_is_listed_twice(self):
+        """Your roster now matches two ways round when it covers the line."""
+        rows = self.picker(product_line=self.line.slug)
+        ids = [d["id"] for d in rows]
+        self.assertEqual(len(ids), len(set(ids)))
+
     def test_mine_still_narrows_when_asked(self):
         names = {d["full_name"] for d in self.picker(mine=1)}
         self.assertEqual(names, {"Mine"})

@@ -3,6 +3,7 @@ from pathlib import Path
 
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db.models import Q
 from django.http import FileResponse, Http404
 from django.utils import timezone
 from rest_framework import status
@@ -227,10 +228,10 @@ def experts(request):
 
     Filters:
       ``?mine=1``            only the experts on the caller's own roster
-      ``?product_line=slug`` only experts who work in that discipline
+      ``?product_line=slug`` that discipline, *plus* the caller's own roster
 
-    The assignment picker uses both: a lead staffs a brief from their own team,
-    in the discipline the brief belongs to — not from a global talent pool.
+    The assignment picker uses the second: your own team, whatever they're
+    tagged with, and then everyone else who covers the brief's discipline.
     """
     if request.method == "POST":
         _require_lead(request.user)
@@ -252,9 +253,17 @@ def experts(request):
         qs = qs.filter(lead=request.user)
     line_slug = request.query_params.get("product_line")
     if line_slug:
-        qs = qs.filter(product_lines__slug=line_slug)
-    qs = qs.select_related("lead").prefetch_related("product_lines").distinct()
-    qs = qs.prefetch_related("product_lines").distinct().order_by("full_name")
+        # Your own people are never filtered out by discipline. A product line
+        # is copied onto an expert from whoever's roster they landed on — no
+        # one curates it, and no lead can edit it — so it says where they came
+        # from, not what they can do. Filtering your roster on it emptied the
+        # "Your team" group without a word and left leads looking at other
+        # people's experts, with no route back to their own. Past your roster
+        # the filter still holds: those are experts you haven't vouched for,
+        # and the tag is the only thing there is to go on.
+        qs = qs.filter(Q(product_lines__slug=line_slug) | Q(lead=request.user))
+    qs = (qs.select_related("lead").prefetch_related("product_lines")
+            .distinct().order_by("full_name"))
     return Response(
         UserSerializer(qs, many=True, context={"viewer": request.user}).data)
 
