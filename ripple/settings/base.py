@@ -31,6 +31,11 @@ env = environ.Env(
     USD_TO_NGN_RATE=(float, 1600.0),
     PAYSTACK_FEE_PERCENT=(float, 1.5),
     PAYSTACK_TRANSFERS_ENABLED=(bool, True),
+    PAYSTACK_REFUNDS_ENABLED=(bool, True),
+    STRIPE_SECRET_KEY=(str, ""),
+    STRIPE_PUBLIC_KEY=(str, ""),
+    STRIPE_WEBHOOK_SECRET=(str, ""),
+    TERMS_VERSION=(str, "2026-08"),
 )
 # Load .env without clobbering real environment variables (so values set in the
 # cPanel Python App UI take precedence over the file).
@@ -144,6 +149,11 @@ CORS_ALLOW_CREDENTIALS = True
 # Scheme-qualified, e.g. https://api.ripplenovate.com
 CSRF_TRUSTED_ORIGINS = env("CSRF_TRUSTED_ORIGINS")
 
+# The terms everybody works under. Bump this when they change and every
+# partner is asked again — an acceptance of last year's terms is not an
+# acceptance of this year's.
+TERMS_VERSION = env("TERMS_VERSION", default="2026-08")
+
 # Frontend base URL (used to build verification / reset links in emails).
 FRONTEND_URL = env("FRONTEND_URL")
 DEFAULT_FROM_EMAIL = env(
@@ -157,5 +167,16 @@ PAYSTACK_CURRENCY = env("PAYSTACK_CURRENCY", default="NGN").upper()
 # Send approved withdrawals through the Paystack Transfers API. Turn off to run
 # payouts by hand (the admin can still record them as paid).
 PAYSTACK_TRANSFERS_ENABLED = env("PAYSTACK_TRANSFERS_ENABLED", default=True)
+# Off means an approved refund is simply recorded, for teams that return
+# money by bank transfer. The books agree either way.
+PAYSTACK_REFUNDS_ENABLED = env("PAYSTACK_REFUNDS_ENABLED", default=True)
+
+# Stripe — a second *collection* rail, for clients Paystack can't bill. Payouts
+# stay entirely on Paystack, which is the right rail for African talent and is
+# not moving. Leave the keys blank and the platform behaves exactly as it did
+# before Stripe existed.
+STRIPE_SECRET_KEY = env("STRIPE_SECRET_KEY", default="")
+STRIPE_PUBLIC_KEY = env("STRIPE_PUBLIC_KEY", default="")
+STRIPE_WEBHOOK_SECRET = env("STRIPE_WEBHOOK_SECRET", default="")
 USD_TO_NGN_RATE = env("USD_TO_NGN_RATE")
 PAYSTACK_FEE_PERCENT = env("PAYSTACK_FEE_PERCENT")

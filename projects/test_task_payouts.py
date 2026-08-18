@@ -45,7 +45,7 @@ class TaskPayoutModelTests(TestCase):
     # --- the pool ---
     def test_the_expert_pool_is_the_expert_share_of_the_quote(self):
         """60% of $5,000 by default."""
-        self.assertEqual(self.project.expert_pool_usd, Decimal("3000.00"))
+        self.assertEqual(self.project.expert_pool_usd, Decimal("3500.00"))
 
     def test_a_per_project_override_moves_the_pool(self):
         self.project.expert_share_percent = Decimal("70")
@@ -57,22 +57,23 @@ class TaskPayoutModelTests(TestCase):
         pool must not do that: allocation asks "what is this project's expert
         share?", and has to keep answering after the money has moved.
 
-        Driven apart deliberately: credit at 60%, then re-set the override to
-        70%. The split still reports the $3,000 that was actually paid; the pool
-        reports the $3,500 the percentages now describe.
+        Driven apart deliberately: credit at the standard 70%, then override to
+        80%. The split still reports the $3,500 that was actually paid; the pool
+        reports the $4,000 the percentages now describe. The two numbers have to
+        differ or this proves nothing.
         """
         self.project.stage = Project.Stage.COMPLETED
         self.project.save(update_fields=["stage"])
         earnings_service.record_project_earnings(self.project)
         self.project.refresh_from_db()
 
-        self.project.expert_share_percent = Decimal("70")
+        self.project.expert_share_percent = Decimal("80")
         self.project.save(update_fields=["expert_share_percent"])
 
         self.assertEqual(self.project.payout_split()["expert_usd"],
-                         Decimal("3000.00"), "history was restated")
+                         Decimal("3500.00"), "history was restated")
         self.assertEqual(self.project.expert_pool_usd,
-                         Decimal("3500.00"), "the pool ignored the override")
+                         Decimal("4000.00"), "the pool ignored the override")
 
     # --- allocation ---
     def test_allocation_adds_up_and_leaves_a_remainder(self):
@@ -80,7 +81,7 @@ class TaskPayoutModelTests(TestCase):
         self.task(amount="1200.00", title="Visual design")
         self.task(amount="600.00", title="Build", assignee=self.chidi)
         self.assertEqual(self.project.allocated_usd, Decimal("2600.00"))
-        self.assertEqual(self.project.unallocated_usd, Decimal("400.00"))
+        self.assertEqual(self.project.unallocated_usd, Decimal("900.00"))
 
     def test_an_unpriced_project_has_its_whole_pool_unallocated(self):
         self.task()
@@ -146,7 +147,7 @@ class LegacyPayoutTests(TestCase):
         self.assertEqual(expert_rows.count(), 1)
         row = expert_rows.get()
         self.assertEqual(row.user_id, self.expert.id)
-        self.assertEqual(row.amount_usd, Decimal("600.00"))   # 60% of $1,000
+        self.assertEqual(row.amount_usd, Decimal("700.00"))   # 70% of $1,000
         self.assertIsNone(row.task_id, "a legacy row is project-level, not task-level")
 
     def test_the_split_still_closes_on_the_quote(self):

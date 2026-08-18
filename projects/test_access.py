@@ -10,9 +10,12 @@ and so could a lead whose application was still sitting in review.
 The negative cases matter most, but the positive ones are here too: the fix is
 only correct if the people who *should* reach a project still can.
 """
+from datetime import timedelta
+
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, override_settings
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from catalog.models import ProductLine
@@ -225,11 +228,24 @@ class ProjectScopeTests(TestCase):
         self.assertEqual(own.stage, Project.Stage.REVIEW)
 
     def test_an_approved_lead_still_runs_their_own_board(self):
-        """The other half: approval gates the actions, it doesn't remove them."""
+        """The other half: approval gates the actions, it doesn't remove them.
+
+        Completing on the client's behalf now has a second gate of its own —
+        the client has to have been reminded and then gone quiet (see
+        `test_completion_guard`). That's a different rule from the one under
+        test here, so the reminder is backdated past the window to get it out
+        of the way rather than deleted, which would stop this covering
+        completion at all.
+        """
         client = as_user(self.lead)
         base = f"/api/projects/{self.project.id}"
         self.assertEqual(client.post(f"{base}/submit-review").status_code, 200)
         self.assertEqual(client.post(f"{base}/remind-review").status_code, 200)
+
+        self.project.refresh_from_db()
+        self.project.review_reminded_at = timezone.now() - timedelta(days=30)
+        self.project.save(update_fields=["review_reminded_at"])
+
         self.assertEqual(client.post(f"{base}/approve").status_code, 200)
         self.project.refresh_from_db()
         self.assertEqual(self.project.stage, Project.Stage.COMPLETED)

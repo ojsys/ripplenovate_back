@@ -240,3 +240,48 @@ class DirectoryTests(TestCase):
         me = APIClient().post(
             "/api/auth/login", {"email": self.someone.email, "password": "x"}).data
         self.assertEqual(bearer(me["access"]).get("/api/users").status_code, 403)
+
+
+class DirectoryScopeTests(TestCase):
+    """A delivery lead needs a client to set a retainer up for. That is not a
+    reason to hand them the impersonation directory."""
+
+    def setUp(self):
+        self.admin = User.objects.create_superuser("dsboss@ril.team", "x")
+        self.lead = User.objects.create_user(
+            "dslead@ril.team", "x", role=User.Role.DELIVERY_LEAD,
+            is_email_verified=True)
+        self.buyer = User.objects.create_user(
+            "dsbuyer@acme.io", "x", full_name="A Buyer",
+            role=User.Role.CLIENT, is_email_verified=True)
+        self.expert = User.objects.create_user(
+            "dsexpert@ril.dev", "x", role=User.Role.EXPERT,
+            is_email_verified=True)
+
+    def signed_in(self, user):
+        me = APIClient().post(
+            "/api/auth/login", {"email": user.email, "password": "x"}).data
+        return bearer(me["access"])
+
+    def test_a_lead_sees_clients_only(self):
+        rows = self.signed_in(self.lead).get("/api/users").data
+        self.assertEqual({r["email"] for r in rows}, {self.buyer.email})
+
+    def test_a_lead_cannot_widen_it_with_a_role_filter(self):
+        """The parameter is ignored for a lead, not honoured — they see clients
+        whatever they ask for, and never another lead's experts."""
+        rows = self.signed_in(self.lead).get("/api/users", {"role": "expert"}).data
+        self.assertEqual({r["role"] for r in rows}, {"client"})
+        self.assertNotIn(self.expert.email, {r["email"] for r in rows})
+
+    def test_an_admin_still_sees_everyone(self):
+        rows = self.signed_in(self.admin).get("/api/users").data
+        self.assertGreaterEqual(len(rows), 4)
+
+    def test_a_client_still_sees_nothing(self):
+        self.assertEqual(
+            self.signed_in(self.buyer).get("/api/users").status_code, 403)
+
+    def test_an_expert_still_sees_nothing(self):
+        self.assertEqual(
+            self.signed_in(self.expert).get("/api/users").status_code, 403)

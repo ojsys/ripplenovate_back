@@ -11,6 +11,8 @@ from django.contrib.auth import get_user_model
 
 from ripple.mailer import send_brand_email
 
+from .models import Project
+
 User = get_user_model()
 logger = logging.getLogger("ripple")
 
@@ -199,27 +201,79 @@ def notify_experts_assigned(project, experts=None):
 
 @_safe
 def notify_update_posted(project, activity):
-    """Notify everyone involved (except the author) when a progress update is posted."""
+    """Tell people an update was posted — but only the right people.
+
+    A top-level update is news for everyone on the project. A **reply** is not:
+    it belongs to a conversation, and mailing the whole team every time two
+    people go back and forth about one file is how a feed people read becomes a
+    filter rule they don't. Replies go to the thread — whoever started it and
+    whoever has answered — plus the project's lead, who is accountable for the
+    work whether or not they've spoken yet.
+    """
     author_email = activity.author.email if activity.author else None
-    recipients = {project.client.email}
-    recipients.update(_team_emails(project))
-    recipients.update(_project_lead_email(project))
+    is_reply = activity.parent_id is not None
+
+    if is_reply:
+        recipients = set(activity.thread_emails) | set(_project_lead_email(project))
+        heading = "New reply"
+        opening = f"{activity.author_name} replied on “{project.title}”:"
+        subject = f"New reply on {project.title}"
+    else:
+        recipients = {project.client.email}
+        recipients.update(_team_emails(project))
+        recipients.update(_project_lead_email(project))
+        heading = f"New update · {activity.get_kind_display()}"
+        opening = f"{activity.author_name} posted an update on “{project.title}”:"
+        subject = f"New update on {project.title}"
+
     recipients.discard(author_email)
-    kind_label = activity.get_kind_display()
+    if not recipients:
+        return
+
+    paragraphs = [opening, f"“{activity.text}”"]
+    # Say what it's about. A comment anchored to a file reads very differently
+    # from the same words floating in a feed, and the mail should carry that.
+    anchor = activity.attachment
+    if anchor is not None:
+        paragraphs.insert(1, f"About: {anchor.label or anchor.display_name}")
+    if is_reply and activity.parent is not None:
+        paragraphs.append(
+            f"In reply to {activity.parent.author_name}: "
+            f"“{activity.parent.text[:160]}”"
+        )
+
     send_brand_email(
-        subject=f"New update on {project.title}",
+        subject=subject,
         to=recipients,
-        heading=f"New update · {kind_label}",
-        paragraphs=[
-            f"{activity.author_name} posted an update on “{project.title}”:",
-            f"“{activity.text}”",
-        ],
+        heading=heading,
+        paragraphs=paragraphs,
         cta=("View the project", _project_url(project)),
     )
 
 
 @_safe
-def notify_submitted_for_review(project):
+def notify_submitted_for_review(project, is_resubmission=False):
+    """Tell the client the work is theirs to look at.
+
+    Resubmission gets its own wording. A client who asked for changes and then
+    received the stock "your project is ready for review" has no way to tell
+    whether their note was acted on or ignored.
+    """
+    if is_resubmission:
+        send_brand_email(
+            subject=f"Your changes are done: {project.title}",
+            to=project.client.email,
+            heading="The changes you asked for are ready",
+            paragraphs=[
+                f"Hi {project.client.full_name or 'there'},",
+                f"The team has made the changes you requested on “{project.title}” "
+                "and sent it back for you to look at.",
+                "Approve the delivery when you're happy, or ask for more changes if "
+                "something still isn't right.",
+            ],
+            cta=("Review the changes", _project_url(project)),
+        )
+        return
     send_brand_email(
         subject=f"Ready for your review: {project.title}",
         to=project.client.email,
@@ -228,8 +282,40 @@ def notify_submitted_for_review(project):
             f"Hi {project.client.full_name or 'there'},",
             f"“{project.title}” has been completed and submitted for your review.",
             "Take a look and approve the delivery when you're happy — that's when funds are released to the talent.",
+            "If something isn't right, you can ask the team for changes instead.",
         ],
         cta=("Review & approve", _project_url(project)),
+    )
+
+
+@_safe
+def notify_changes_requested(project, revision):
+    """Tell the delivery team the client sent the work back.
+
+    Goes to the lead and every assigned expert, because "who is meant to act on
+    this?" has no single answer on a team — and the note itself is carried in
+    the mail rather than linked to, so nobody has to open the app to find out
+    how bad it is.
+    """
+    recipients = set(_project_lead_email(project)) | _team_emails(project)
+    if not recipients:
+        return
+    round_label = (
+        "" if project.revision_rounds <= 1
+        else f" This is change request #{project.revision_rounds} on this project."
+    )
+    send_brand_email(
+        subject=f"Changes requested: {project.title}",
+        to=sorted(recipients),
+        heading="The client has asked for changes",
+        paragraphs=[
+            f"{_client_name(project)} has sent “{project.title}” back for changes, "
+            f"and it has moved to In Progress.{round_label}",
+            f"What they said: “{revision.note}”",
+            "Work through it, then submit for review again — that's what closes the "
+            "request. Nothing already approved and paid has been reversed.",
+        ],
+        cta=("Open the project", _project_url(project)),
     )
 
 
@@ -488,4 +574,167 @@ def notify_task_removed(project, title, assignee, reason, amount=0):
             "Your quote is unchanged. Get in touch if this isn't what you expected.",
         ],
         cta=("View the project", _project_url(project)),
+    )
+
+
+@_safe
+def notify_project_cancelled(project, refund=None):
+    """Tell everyone attached that the work has stopped, and why.
+
+    Goes to the client and the whole delivery team, whoever pulled the trigger.
+    A cancellation someone finds out about by noticing a project missing from
+    their board is the worst way to learn it.
+    """
+    recipients = ({project.client.email}
+                  | set(_project_lead_email(project))
+                  | _team_emails(project))
+    if not recipients:
+        return
+    paragraphs = [
+        f"“{project.title}” ({project.code}) has been cancelled.",
+        f"Reason given: “{project.cancellation_reason}”",
+    ]
+    if refund is not None:
+        paragraphs.append(
+            f"A refund of {_money(refund.amount_usd)} has been raised on it — "
+            "the client will get a separate note about that."
+        )
+    paragraphs.append(
+        "Any work already approved and paid stays paid. Nothing has been "
+        "reversed for the team."
+    )
+    send_brand_email(
+        subject=f"Project cancelled: {project.title}",
+        to=sorted(recipients),
+        heading="This project has been cancelled",
+        paragraphs=paragraphs,
+        cta=("Open the project", _project_url(project)),
+    )
+
+
+@_safe
+def notify_change_order_raised(project, order):
+    """Ask the client to pay for extra scope.
+
+    Only the client — nobody else needs telling that a bill was drafted, and the
+    team hears when it's actually paid, which is the point at which their pool
+    grows.
+    """
+    send_brand_email(
+        subject=f"Extra work to approve: {project.title}",
+        to=project.client.email,
+        heading="There's extra work to approve",
+        paragraphs=[
+            f"Hi {project.client.full_name or 'there'},",
+            f"The team has priced some additional work on “{project.title}” at "
+            f"{_money(order.amount_usd)}.",
+            f"What it covers: “{order.description}”",
+            "Nothing changes until you pay for it — your original quote is "
+            "unaffected, and the work already underway carries on either way.",
+        ],
+        cta=("Review & pay", _project_url(project)),
+    )
+
+
+@_safe
+def notify_change_order_paid(project, order):
+    """Tell the delivery team the extra scope is funded and the pool has grown."""
+    recipients = set(_project_lead_email(project)) | _team_emails(project)
+    if not recipients:
+        return
+    send_brand_email(
+        subject=f"Extra scope paid: {project.title}",
+        to=sorted(recipients),
+        heading="The client paid for the extra work",
+        paragraphs=[
+            f"{_client_name(project)} has paid {_money(order.amount_usd)} for "
+            f"additional work on “{project.title}”.",
+            f"What it covers: “{order.description}”",
+            "The expert pool has grown by the usual share of that, so there's "
+            "more to price the new tasks against.",
+        ],
+        cta=("Open the project", _project_url(project)),
+    )
+
+
+@_safe
+def notify_feedback_left(project, feedback):
+    """Tell the lead what their client said. Only the lead.
+
+    Not the experts: this is the client's private word about the engagement,
+    and a 2/5 landing in four inboxes is a way to lose a team over a problem
+    the lead hasn't had a chance to look at yet.
+    """
+    recipients = _project_lead_email(project)
+    if not recipients:
+        return
+    stars = "★" * feedback.rating + "☆" * (5 - feedback.rating)
+    paragraphs = [
+        f"{_client_name(project)} rated “{project.title}” {feedback.rating}/5.  {stars}",
+    ]
+    if feedback.comment:
+        paragraphs.append(f"What they said: “{feedback.comment}”")
+    if feedback.would_work_again is False:
+        paragraphs.append(
+            "They said they would not work with this team again — worth a "
+            "conversation before it becomes a lost client."
+        )
+    send_brand_email(
+        subject=f"Client feedback on {project.title}",
+        to=recipients,
+        heading="Your client left feedback",
+        paragraphs=paragraphs,
+        cta=("Open the project", _project_url(project)),
+    )
+
+
+@_safe
+def notify_cycle_raised(cycle):
+    """Tell the client their next month is ready to pay.
+
+    Sent a week ahead of the period, so paying is a task with a deadline rather
+    than a surprise. The team hears nothing yet — there is no work to do until
+    the money lands.
+    """
+    engagement = cycle.engagement
+    send_brand_email(
+        subject=f"Your {cycle.period_start:%B} invoice: {engagement.title}",
+        to=cycle.client.email,
+        heading=f"{cycle.period_start:%B %Y} is ready",
+        paragraphs=[
+            f"Hi {cycle.client.full_name or 'there'},",
+            f"Your next month of “{engagement.title}” runs from "
+            f"{cycle.period_start:%-d %B} to {cycle.period_end:%-d %B} and comes "
+            f"to {_money(cycle.quote_usd)}.",
+            "Paying starts the month. Nothing changes on the work already "
+            "delivered.",
+        ],
+        cta=("Review & pay", _project_url(cycle)),
+    )
+
+
+@_safe
+def notify_engagement_ended(engagement, final_cycle=None):
+    """Tell everyone a retainer has stopped, and what happens to the last month."""
+    recipients = {engagement.client.email}
+    if engagement.lead_id and engagement.lead:
+        recipients.add(engagement.lead.email)
+    if final_cycle:
+        recipients |= _team_emails(final_cycle)
+
+    paragraphs = [
+        f"“{engagement.title}” has ended and no further months will be billed.",
+    ]
+    if engagement.end_reason:
+        paragraphs.append(f"Reason given: “{engagement.end_reason}”")
+    if final_cycle and final_cycle.stage not in Project.CLOSED_STAGES:
+        paragraphs.append(
+            f"The current month runs to {final_cycle.period_end:%-d %B} and is "
+            "unaffected — it's paid for, and it will be delivered."
+        )
+    send_brand_email(
+        subject=f"Retainer ended: {engagement.title}",
+        to=sorted(recipients),
+        heading="This retainer has ended",
+        paragraphs=paragraphs,
     )

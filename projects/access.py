@@ -55,14 +55,36 @@ def is_project_expert(user, project):
             or any(e.id == user.id for e in project.experts.all()))
 
 
+def org_membership(user, project):
+    """This person's seat at the buying company, or None.
+
+    Separate from `can_access_project` because two questions hang off it and
+    they have different answers: *may they see this project at all* (any seat),
+    and *may they see the work* (any seat but billing).
+    """
+    if not project.organisation_id:
+        return None
+    return next(
+        (m for m in user.organisation_memberships.all()
+         if m.organisation_id == project.organisation_id),
+        None,
+    )
+
+
 def can_access_project(user, project):
     """Whether this person is attached to this project at all.
 
-    The client who commissioned it, the experts delivering it, the lead running
-    it, the business developer credited with it, and admins — plus a lead
-    looking at an unclaimed brief in one of their own disciplines, which is the
-    only way one ever gets quoted. Nobody else: a brief can contain anything
-    from budgets to unreleased plans.
+    The client who commissioned it, anyone else at their company, the experts
+    delivering it, the lead running it, the business developer credited with
+    it, and admins — plus a lead looking at an unclaimed brief in one of their
+    own disciplines, which is the only way one ever gets quoted. Nobody else: a
+    brief can contain anything from budgets to unreleased plans.
+
+    The company clause is the one that widened. It has to: a buyer with a
+    procurement contact, a project owner and a budget holder previously had to
+    share one login or post from three unconnected accounts. It is scoped to
+    the project's own `organisation` and nothing else — being a client is still
+    not a reason to see another company's work.
     """
     if user.is_superuser:
         return True
@@ -71,10 +93,31 @@ def can_access_project(user, project):
         return True
     if is_project_expert(user, project):
         return True
+    if org_membership(user, project) is not None:
+        return True
     return (user.role == Role.DELIVERY_LEAD
             and project.lead_id is None
             and project.product_line_id is not None
             and user.product_lines.filter(id=project.product_line_id).exists())
+
+
+def can_see_delivery(user, project):
+    """Whether they see the work itself, or only what it cost.
+
+    A finance contact needs the invoice and nothing else. Handing them the
+    brief, the deliverables and the team's progress updates because they have
+    to pay a bill is the over-sharing that stops a buyer rolling the platform
+    out past one team — and it is not something the person who posted the brief
+    ever agreed to.
+
+    Everyone who isn't on a billing-only seat sees everything they always did.
+    """
+    if user.is_superuser or user.id == project.client_id:
+        return True
+    membership = org_membership(user, project)
+    if membership is None:
+        return True
+    return membership.sees_delivery
 
 
 def leads_project(user, project):

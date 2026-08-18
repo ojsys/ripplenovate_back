@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import logging
 
 from django.conf import settings
 from django.http import HttpResponse
@@ -12,21 +13,27 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from accounts import impersonation
+from accounts.models import SiteSettings
 from projects.access import can_access_project
 from projects.models import Project
 
 from . import earnings as earnings_service
-from . import notifications, paystack, transfers
-from .models import Earning, Payment, Withdrawal
+from . import gateways, notifications, paystack, stripe_gateway, transfers
+from . import refunds as refund_service
+from .models import Earning, Payment, Refund, Withdrawal
 from .serializers import (
     EarningSerializer,
     PayoutAccountSerializer,
+    RefundCreateSerializer,
+    RefundSerializer,
     ResolveAccountSerializer,
     TransferOtpSerializer,
     WithdrawalCreateSerializer,
     WithdrawalSerializer,
     WithdrawalSettleSerializer,
 )
+
+logger = logging.getLogger("ripple")
 
 
 @api_view(["POST"])
@@ -43,8 +50,42 @@ def initialize_payment(request, pk):
             status=status.HTTP_400_BAD_REQUEST,
         )
     try:
-        result = paystack.initialize(project, request.user)
-    except paystack.PaystackError as exc:
+        result = gateways.initialize(project, request.user)
+    except gateways.UnsupportedCurrency as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+    except (paystack.PaystackError, stripe_gateway.StripeError) as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+    return Response(result)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def initialize_change_order_payment(request, pk):
+    """The client paying for extra scope on a project already underway.
+
+    A separate charge from the original invoice, deliberately: `quote_usd`
+    locks at payment so the settled invoice and the snapshotted earnings can
+    never disagree, and a change order adds contract value beside it rather
+    than editing it.
+    """
+    from projects.models import ChangeOrder
+
+    order = (ChangeOrder.objects.select_related("project")
+             .filter(pk=pk).first())
+    if not order:
+        return Response({"detail": "Change order not found."},
+                        status=status.HTTP_404_NOT_FOUND)
+    if order.project.client_id != request.user.id:
+        raise PermissionDenied("Only the project's client can pay for this.")
+    if not order.is_payable:
+        return Response(
+            {"detail": f"This change order is already {order.get_status_display().lower()}."},
+            status=status.HTTP_400_BAD_REQUEST)
+    try:
+        result = gateways.initialize(order.project, request.user, change_order=order)
+    except gateways.UnsupportedCurrency as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+    except (paystack.PaystackError, stripe_gateway.StripeError) as exc:
         return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
     return Response(result)
 
@@ -53,8 +94,8 @@ def initialize_payment(request, pk):
 @permission_classes([IsAuthenticated])
 def verify_payment(request, reference):
     try:
-        payment = paystack.verify(reference)
-    except paystack.PaystackError as exc:
+        payment = gateways.verify(reference)
+    except (paystack.PaystackError, stripe_gateway.StripeError) as exc:
         return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
     return Response({
         "reference": payment.reference,
@@ -354,4 +395,167 @@ def paystack_webhook(request):
             notifications.notify_withdrawal_settled(withdrawal)
 
     # Always 200 so Paystack stops retrying a handled event.
+    return HttpResponse(status=200)
+
+
+# ---------------------------------------------------------------------------
+# Refunds
+# ---------------------------------------------------------------------------
+
+def _may_refund(user, project):
+    """Who can put a refund on a project: its lead, or an admin."""
+    if user.is_superuser:
+        return True
+    return (user.role == user.Role.DELIVERY_LEAD
+            and project.lead_id == user.id
+            and user.is_approved)
+
+
+def _refund_payload(refund):
+    return RefundSerializer(refund).data
+
+
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def project_refunds(request, pk):
+    """List a project's refunds, or raise a new one.
+
+    GET is open to anyone on the project — a client is entitled to see what
+    they've been refunded without asking. POST is the delivery side only.
+    """
+    project = Project.objects.filter(pk=pk).first()
+    if not project:
+        return Response({"detail": "Project not found."},
+                        status=status.HTTP_404_NOT_FOUND)
+    if not can_access_project(request.user, project):
+        raise PermissionDenied("Not your project.")
+
+    if request.method == "GET":
+        rows = project.refunds.select_related("requested_by", "approved_by")
+        return Response({
+            "refunds": RefundSerializer(rows, many=True).data,
+            # What another refund would cost, so a lead sees the funding split
+            # before committing rather than after.
+            "collected_usd": str(project.collected_usd),
+            "refunded_usd": str(project.refunded_usd),
+            "refundable_usd": str(project.refundable_usd),
+            "free_refund_usd": str(project.free_refund_usd),
+            "admin_threshold_usd": str(
+                SiteSettings.load().refund_admin_threshold_usd),
+        })
+
+    if not _may_refund(request.user, project):
+        raise PermissionDenied(
+            "Only this project's delivery lead or an administrator can refund it."
+        )
+    serializer = RefundCreateSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    try:
+        refund = refund_service.request_refund(
+            project, request.user,
+            serializer.validated_data["amount_usd"],
+            serializer.validated_data["reason"],
+        )
+    except refund_service.RefundError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    # An approved refund still has to actually move; a requested one waits.
+    if refund.status == Refund.Status.APPROVED:
+        _send_refund(refund, request.user)
+    notifications.notify_refund_raised(refund)
+    return Response(_refund_payload(refund), status=status.HTTP_201_CREATED)
+
+
+def _send_refund(refund, actor, manually=False):
+    """Move an approved refund, or record it if transfers are off.
+
+    Mirrors how payouts already work: when the gateway is disabled the platform
+    is returning money by hand, and the ledger has to agree with reality either
+    way.
+    """
+    payment = (refund.project.payments
+               .filter(status=Payment.Status.SUCCESS)
+               .order_by("-paid_at", "-id").first())
+    if manually or not payment:
+        # Nothing to reverse at a gateway — record it and let a human chase.
+        return refund_service.settle(refund, manually=True)
+    # Down the rail it came up. Re-routing a refund to today's default would
+    # try to return money through a provider that never received it.
+    if not gateways.refunds_enabled(payment):
+        return refund_service.settle(refund, manually=True)
+    try:
+        raw = gateways.refund(payment, refund.amount_usd)
+    except (paystack.PaystackError, stripe_gateway.StripeError) as exc:
+        return refund_service.mark_failed(refund, str(exc))
+    return refund_service.settle(
+        refund, gateway=payment.gateway,
+        gateway_reference=str(raw.get("id") or ""), gateway_raw=raw,
+    )
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def decide_refund(request, pk):
+    """An administrator approving or rejecting a refund above the lead's limit."""
+    refund = Refund.objects.select_related("project").filter(pk=pk).first()
+    if not refund:
+        return Response({"detail": "Refund not found."},
+                        status=status.HTTP_404_NOT_FOUND)
+    decision = (request.data.get("decision") or "").strip()
+    if decision not in ("approve", "reject"):
+        return Response({"detail": "Decide either approve or reject."},
+                        status=status.HTTP_400_BAD_REQUEST)
+    try:
+        if decision == "approve":
+            refund_service.approve_refund(refund, request.user)
+            _send_refund(refund, request.user)
+        else:
+            refund_service.reject_refund(
+                refund, request.user, request.data.get("reason", ""))
+    except refund_service.RefundError as exc:
+        return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+    notifications.notify_refund_decided(refund)
+    return Response(_refund_payload(refund))
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def refund_queue(request):
+    """Refunds waiting on an administrator, plus the reserve's own position."""
+    if not request.user.is_superuser:
+        raise PermissionDenied("Only an administrator can see the refund queue.")
+    pending = (Refund.objects
+               .filter(status=Refund.Status.REQUESTED)
+               .select_related("project", "requested_by"))
+    return Response({
+        "pending": RefundSerializer(pending, many=True).data,
+        "reserve_balance_usd": str(refund_service.reserve_balance()),
+        "reserve_percent": str(SiteSettings.load().reserve_percent),
+    })
+
+
+@csrf_exempt
+def stripe_webhook(request):
+    """Stripe server-to-server events.
+
+    The signature check is the whole security model here: this URL is public,
+    and without it anybody could mark their own project paid. It is done before
+    the body is parsed, on the raw bytes, because that is what was signed.
+    """
+    if request.method != "POST":
+        return HttpResponse(status=405)
+    try:
+        event = stripe_gateway.verify_webhook(
+            request.body, request.headers.get("stripe-signature", ""))
+    except stripe_gateway.StripeError as exc:
+        logger.warning("Rejected a Stripe webhook: %s", exc)
+        return HttpResponse(status=401)
+
+    try:
+        stripe_gateway.handle_event(event)
+    except Exception as exc:  # noqa: BLE001
+        # A 500 makes Stripe retry, which is right for a transient fault and
+        # wrong for a poisoned event that will fail forever. Logged and
+        # acknowledged; the verify-on-return path is the backstop.
+        logger.error("Stripe event %s failed: %s", event.get("id"), exc)
     return HttpResponse(status=200)

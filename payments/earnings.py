@@ -97,10 +97,13 @@ def record_task_earning(task):
     if not project.is_paid:
         return None
 
-    quote = Decimal(project.quote_usd or 0)
-    # This task's slice of the quote, so the field keeps meaning what it always
-    # meant and the per-line reporting needs no special case.
-    percent = _money(task.amount_usd / quote * 100) if quote else ZERO
+    # This task's slice of the contract, so the field keeps meaning what it
+    # always meant and the per-line reporting needs no special case. The
+    # contract rather than the quote: on a project with paid extra scope the
+    # pool was grown from the contract, so measuring a task against the quote
+    # alone would report percentages that sum past the expert share.
+    contract = project.contract_usd
+    percent = _money(task.amount_usd / contract * 100) if contract else ZERO
     earning, created = Earning.objects.get_or_create(
         task=task,
         user_id=task.assignee_id,

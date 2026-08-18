@@ -165,3 +165,96 @@ def notify_withdrawal_settled(withdrawal):
         paragraphs=paragraphs,
         cta=("View my earnings", _earnings_url()),
     )
+
+
+def _admin_emails():
+    from django.contrib.auth import get_user_model
+
+    User = get_user_model()
+    return [u.email for u in User.objects.filter(is_superuser=True, is_active=True)]
+
+
+@_safe
+def notify_refund_raised(refund):
+    """Tell the client money is coming back, and admins if it needs a decision.
+
+    The client is told either way. A refund that has been raised but is waiting
+    on an internal approval is still news they'd rather have than not — silence
+    while a decision is pending is how a resolved complaint turns into a
+    chargeback.
+    """
+    project = refund.project
+    pending = refund.status == refund.Status.REQUESTED
+    if pending:
+        send_brand_email(
+            subject=f"Refund needs approval: {project.code}",
+            to=_admin_emails(),
+            heading="A refund is waiting on you",
+            paragraphs=[
+                f"{refund.requested_by and (refund.requested_by.full_name or refund.requested_by.email)} "
+                f"has raised a refund of {_usd(refund.amount_usd)} on "
+                f"“{project.title}” ({project.code}).",
+                f"Reason given: “{refund.reason}”",
+                "It's above the amount a delivery lead can issue on their own, "
+                "so it won't go anywhere until you approve it.",
+            ],
+        )
+    send_brand_email(
+        subject=f"About your refund: {project.title}",
+        to=project.client.email,
+        heading="We're refunding you" if not pending else "Your refund is being processed",
+        paragraphs=[
+            f"Hi {project.client.full_name or 'there'},",
+            f"A refund of {_usd(refund.amount_usd)} has been raised on "
+            f"“{project.title}”.",
+            ("It's going through an internal approval and you'll hear from us "
+             "again as soon as it's on its way."
+             if pending else
+             "It's on its way back to the card or account you paid from. "
+             "Depending on your bank this can take a few working days."),
+        ],
+    )
+
+
+@_safe
+def notify_refund_decided(refund):
+    """The outcome of an admin's decision, to the client and the lead."""
+    project = refund.project
+    recipients = {project.client.email}
+    if project.lead_id and project.lead:
+        recipients.add(project.lead.email)
+    if refund.status == refund.Status.REJECTED:
+        send_brand_email(
+            subject=f"Refund not approved: {project.code}",
+            to=sorted(recipients),
+            heading="That refund wasn't approved",
+            paragraphs=[
+                f"The {_usd(refund.amount_usd)} refund raised on “{project.title}” "
+                "has not been approved.",
+                f"Reason: “{refund.failure_reason or 'No reason recorded.'}”",
+            ],
+        )
+        return
+    if refund.status == refund.Status.FAILED:
+        send_brand_email(
+            subject=f"Refund failed: {project.code}",
+            to=sorted(recipients),
+            heading="A refund didn't go through",
+            paragraphs=[
+                f"The {_usd(refund.amount_usd)} refund on “{project.title}” was "
+                "approved but the payment provider refused it.",
+                f"What they said: “{refund.failure_reason}”",
+                "Nothing has left the platform, so it can be retried.",
+            ],
+        )
+        return
+    send_brand_email(
+        subject=f"Your refund is on its way: {project.title}",
+        to=sorted(recipients),
+        heading="Refund approved",
+        paragraphs=[
+            f"The {_usd(refund.amount_usd)} refund on “{project.title}” has been "
+            "approved and sent.",
+            "Depending on the bank it can take a few working days to appear.",
+        ],
+    )

@@ -44,6 +44,14 @@ def quote_breakdown(project):
     return {"subtotal_usd": subtotal, "fee_usd": fee, "total_usd": total}
 
 
+def change_order_breakdown(change_order):
+    """The invoice for extra scope. Same fee treatment as the quote."""
+    subtotal = _money(change_order.amount_usd)
+    fee_pct = Decimal(str(settings.PAYSTACK_FEE_PERCENT))
+    fee = _money(subtotal * fee_pct / Decimal(100))
+    return {"subtotal_usd": subtotal, "fee_usd": fee, "total_usd": _money(subtotal + fee)}
+
+
 def usd_to_ngn_rate():
     """The rate to bill at — admin-editable in Site settings, .env as fallback."""
     return SiteSettings.usd_to_ngn()
@@ -59,9 +67,16 @@ def charge_amount(total_usd):
     return currency, int((_money(total_usd) * 100).to_integral_value(rounding=ROUND_HALF_UP))
 
 
-def initialize(project, user):
-    """Create/refresh a pending Payment and initialize a Paystack transaction."""
-    breakdown = quote_breakdown(project)
+def initialize(project, user, change_order=None):
+    """Create a pending Payment and initialize a Paystack transaction.
+
+    With a `change_order`, this bills the extra scope instead of the quote —
+    same processing fee, same currency conversion, same webhook path. Keeping
+    it one function means a change order can never be charged by a slightly
+    different route than the invoice it sits beside.
+    """
+    breakdown = (change_order_breakdown(change_order) if change_order
+                 else quote_breakdown(project))
     currency, amount_subunit = charge_amount(breakdown["total_usd"])
     reference = f"RIL-{uuid.uuid4().hex[:12].upper()}"
 
@@ -77,6 +92,7 @@ def initialize(project, user):
                 "project_id": project.id,
                 "project_code": project.code,
                 "usd_total": str(breakdown["total_usd"]),
+                "change_order_id": change_order.id if change_order else None,
             },
         },
         timeout=20,
@@ -88,6 +104,7 @@ def initialize(project, user):
     body = data["data"]
     payment = Payment.objects.create(
         project=project,
+        change_order=change_order,
         reference=reference,
         access_code=body.get("access_code", ""),
         amount_subunit=amount_subunit,
@@ -120,6 +137,20 @@ def _mark_paid(payment, raw):
     payment.save(update_fields=["status", "paid_at", "raw"])
 
     project = payment.project
+    if payment.change_order_id:
+        # Extra scope, not the kickoff invoice: the stage doesn't move, the
+        # contract value does — and with it the pool the lead has to hand out.
+        order = payment.change_order
+        if order.status != order.Status.PAID:
+            order.status = order.Status.PAID
+            order.paid_at = timezone.now()
+            order.save(update_fields=["status", "paid_at"])
+            log_activity(
+                project, project.client,
+                f"Paid for extra scope (${order.amount_usd:,.2f}): {order.description}",
+            )
+            notifications.notify_change_order_paid(project, order)
+        return payment
     if project.stage in (project.Stage.QUOTED, project.Stage.SUBMITTED):
         project.stage = project.Stage.PAID
         project.save(update_fields=["stage"])
@@ -153,3 +184,39 @@ def verify(reference):
         payment.raw = body
         payment.save(update_fields=["status", "raw"])
     return payment
+
+
+def refunds_enabled():
+    return bool(settings.PAYSTACK_REFUNDS_ENABLED)
+
+
+def create_refund(payment, amount_usd):
+    """Ask Paystack to return part (or all) of a charge to the client.
+
+    Paystack refunds are keyed on the original transaction, which is why the
+    caller has to hand over the `Payment` rather than just an amount — a
+    project can in principle have been settled by more than one charge, and
+    guessing which to reverse is not something this should do silently.
+
+    The amount is converted at the *original* charge's rate, not today's. A
+    client who paid ₦1,600,000 for $1,000 gets their naira back, not whatever
+    $1,000 happens to be worth this week.
+    """
+    if payment.currency == "NGN":
+        rate = payment.usd_to_ngn_rate or usd_to_ngn_rate()
+        subunit = int((_money(Decimal(amount_usd) * rate) * 100)
+                      .to_integral_value(rounding=ROUND_HALF_UP))
+    else:
+        subunit = int((_money(amount_usd) * 100)
+                      .to_integral_value(rounding=ROUND_HALF_UP))
+
+    resp = requests.post(
+        f"{PAYSTACK_BASE}/refund",
+        headers=_headers(),
+        json={"transaction": payment.reference, "amount": subunit},
+        timeout=30,
+    )
+    data = resp.json()
+    if not resp.ok or not data.get("status"):
+        raise PaystackError(data.get("message") or "Paystack refused the refund.")
+    return data["data"]

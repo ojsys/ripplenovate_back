@@ -365,7 +365,7 @@ class LegacyProjectPayoutTests(TestCase):
         rows = Earning.objects.filter(project=self.project,
                                       kind=Earning.Kind.EXPERT)
         self.assertEqual(rows.count(), 1)
-        self.assertEqual(rows.get().amount_usd, Decimal("600.00"))
+        self.assertEqual(rows.get().amount_usd, Decimal("700.00"))
         self.assertIsNone(rows.get().task_id)
 
     def test_an_approved_unpriced_task_credits_nothing_on_its_own(self):
@@ -374,4 +374,4 @@ class LegacyProjectPayoutTests(TestCase):
 
     def test_pending_still_projects_the_whole_share(self):
         self.assertEqual(
-            earnings_service.summary(self.expert)["pending_usd"], Decimal("600.00"))
+            earnings_service.summary(self.expert)["pending_usd"], Decimal("700.00"))

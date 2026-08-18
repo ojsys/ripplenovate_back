@@ -1,6 +1,8 @@
+from decimal import Decimal
+
 from rest_framework import serializers
 
-from .models import Earning, Withdrawal
+from .models import Earning, Refund, Withdrawal
 
 
 class EarningSerializer(serializers.ModelSerializer):
@@ -84,3 +86,38 @@ class WithdrawalSettleSerializer(serializers.Serializer):
 
 class TransferOtpSerializer(serializers.Serializer):
     otp = serializers.CharField(max_length=12)
+
+
+class RefundSerializer(serializers.ModelSerializer):
+    project_code = serializers.CharField(source="project.code", read_only=True)
+    project_title = serializers.CharField(source="project.title", read_only=True)
+    requested_by_name = serializers.SerializerMethodField()
+    status_label = serializers.CharField(source="get_status_display", read_only=True)
+
+    class Meta:
+        model = Refund
+        fields = [
+            "id", "project", "project_code", "project_title", "amount_usd",
+            "reason", "status", "status_label", "requested_by_name",
+            "funded_from_held_usd", "funded_from_reserve_usd", "absorbed_usd",
+            "settled_manually", "failure_reason", "created_at", "processed_at",
+        ]
+        read_only_fields = fields
+
+    def get_requested_by_name(self, obj):
+        if not obj.requested_by:
+            return ""
+        return obj.requested_by.full_name or obj.requested_by.email
+
+
+class RefundCreateSerializer(serializers.Serializer):
+    amount_usd = serializers.DecimalField(
+        max_digits=12, decimal_places=2, min_value=Decimal("0.01")
+    )
+    reason = serializers.CharField(max_length=2000)
+
+    def validate_reason(self, value):
+        value = value.strip()
+        if not value:
+            raise serializers.ValidationError("Say why this is being refunded.")
+        return value

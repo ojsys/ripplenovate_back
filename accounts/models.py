@@ -534,6 +534,48 @@ class EmailToken(models.Model):
         self.save(update_fields=["used_at"])
 
 
+class Notification(models.Model):
+    """One thing that happened, waiting in someone's bell.
+
+    Written by `send_brand_email` rather than by each caller, deliberately. The
+    two channels then share one recipient list by construction — there is no
+    way to add a notification that emails somebody and doesn't reach their
+    bell, or the reverse, because there is only one place either happens.
+
+    That matters more than it sounds. Sixteen notification types previously
+    terminated in SMTP alone, which made email deliverability the product's
+    uptime: one spam classification and a client silently stopped responding —
+    now the exact condition under which a lead may close a project over their
+    head.
+
+    Deliberately dumb. No types, no grouping, no preferences. A title, a line
+    of body, and somewhere to go. Those can be added when there is evidence
+    anybody wants them.
+    """
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+        related_name="notifications",
+    )
+    title = models.CharField(max_length=200)
+    body = models.TextField(blank=True)
+    # Where the bell takes you. Stored as a path rather than a FK so this model
+    # stays free of every app that might want to notify from one.
+    url = models.CharField(max_length=300, blank=True)
+    read_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+        indexes = [
+            # The unread count runs on every /auth/me, which is every page load.
+            models.Index(fields=["user", "read_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.user_id} · {self.title}"
+
+
 class ImpersonationEvent(models.Model):
     """A record that an admin signed in as somebody else.
 
@@ -576,10 +618,21 @@ class SiteSettings(models.Model):
 
     # Fallbacks used before the row exists (and by the payout math if the table
     # hasn't been migrated yet).
-    DEFAULT_EXPERT_SHARE = Decimal("60.00")
+    # The people who do the work take the largest share by a wide margin. The
+    # platform's cut is whatever the other three don't claim — 15% on a direct
+    # project, 10% once a business developer's commission comes out of it.
+    DEFAULT_EXPERT_SHARE = Decimal("70.00")
     DEFAULT_LEAD_SHARE = Decimal("15.00")
     DEFAULT_BUSINESS_DEV_SHARE = Decimal("5.00")
     DEFAULT_MIN_WITHDRAWAL = Decimal("50.00")
+    # A working week plus a weekend. Long enough that a client on leave isn't
+    # closed out behind their back, short enough that a team isn't left unpaid
+    # by someone who has simply stopped replying.
+    DEFAULT_CLIENT_SILENCE_DAYS = 7
+    # Small enough not to matter on a good month, large enough to cover the
+    # occasional failed project without reaching into working capital.
+    DEFAULT_RESERVE_PERCENT = Decimal("5.00")
+    DEFAULT_REFUND_THRESHOLD = Decimal("500.00")
 
     brand_name = models.CharField(max_length=100, default="Ripple Innovation Labs")
     tagline = models.CharField(max_length=150, default="Work Globally · Thrive Locally")
@@ -636,6 +689,35 @@ class SiteSettings(models.Model):
         default=DEFAULT_MIN_WITHDRAWAL,
         validators=[MinValueValidator(Decimal("0"))],
         help_text="The smallest balance an expert or delivery lead can withdraw.",
+    )
+    reserve_percent = models.DecimalField(
+        "Refund reserve (% of the platform's share)",
+        max_digits=5,
+        decimal_places=2,
+        default=DEFAULT_RESERVE_PERCENT,
+        validators=[MinValueValidator(Decimal("0")), MaxValueValidator(Decimal("100"))],
+        help_text="Set aside from the platform's own share of each completed "
+                  "project, to fund refunds on work that has already been paid "
+                  "out. This never changes what an expert, delivery lead or "
+                  "business developer earns — it comes out of the remainder.",
+    )
+    refund_admin_threshold_usd = models.DecimalField(
+        "Refund needing admin approval (USD)",
+        max_digits=10,
+        decimal_places=2,
+        default=DEFAULT_REFUND_THRESHOLD,
+        validators=[MinValueValidator(Decimal("0"))],
+        help_text="A delivery lead can issue refunds up to this amount on their "
+                  "own projects. Anything larger waits for an administrator.",
+    )
+    client_silence_days = models.PositiveIntegerField(
+        "Days before a lead may close a silent client's project",
+        default=DEFAULT_CLIENT_SILENCE_DAYS,
+        help_text="How long after reminding a client that a delivery lead may "
+                  "complete a project on their behalf and release the team's "
+                  "earnings. The clock starts at the first reminder and resets "
+                  "if the client says anything. A second delivery lead can "
+                  "countersign instead of waiting.",
     )
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -730,3 +812,177 @@ class SiteSettings(models.Model):
             "min_withdrawal_usd": pick("min_withdrawal_usd", cls.DEFAULT_MIN_WITHDRAWAL),
             "require_kyc_for_payout": bool(row.get("require_kyc_for_payout")),
         }
+
+
+class Organisation(models.Model):
+    """A company that buys work, as an entity rather than a string.
+
+    `User.company` was free text, which meant one client meant one login. Any
+    real B2B buyer has a procurement contact, a project owner and a budget
+    holder, and all three need to see the work — so the free-text field made
+    every multi-person buyer either share a password or post their briefs from
+    three unconnected accounts.
+
+    Every client belongs to exactly one organisation, including the sole trader
+    who has never heard the word: the migration gives them a personal one. One
+    code path afterwards, rather than "an org, or else the old behaviour".
+    """
+
+    name = models.CharField(max_length=150)
+    slug = models.SlugField(max_length=170, unique=True)
+    # Where invoices go when it isn't the person who posted the brief. Blank
+    # means "whoever posted it", which is the common case.
+    billing_email = models.EmailField(blank=True)
+    # What this buyer wants to be charged in. Quotes are stored in USD
+    # regardless — this only decides the currency on the card, and with it
+    # which rail can carry the charge. Blank means the platform default.
+    preferred_currency = models.CharField(
+        max_length=3, blank=True,
+        help_text="e.g. USD, GBP, EUR, NGN. Blank uses the platform default. "
+                  "Quotes are always agreed in USD; this is only what the "
+                  "client's card is charged in.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+    @property
+    def owner_emails(self):
+        return [m.user.email for m in self.memberships.all()
+                if m.role == OrganisationMember.Role.OWNER]
+
+    @classmethod
+    def ensure_for(cls, user):
+        """The organisation this client buys through, creating it if needed.
+
+        Called when a client signs up. Matches an existing company on a
+        case-insensitive, whitespace-collapsed name so "Acme Ltd" and "acme
+        ltd" land in the same place — and matches on nothing cleverer than
+        that, because wrongly merging two real companies would show one buyer
+        another's briefs and budgets.
+
+        A client with no company named gets a personal organisation. Odd to
+        look at, much better to program against: one shape everywhere instead
+        of "an org, or else the old behaviour".
+        """
+        import re
+
+        from django.utils.text import slugify
+
+        existing = user.organisation_memberships.first()
+        if existing:
+            return existing.organisation
+
+        typed = (user.company or "").strip()
+        if typed:
+            key = re.sub(r"\s+", " ", typed).lower()
+            org = next(
+                (o for o in cls.objects.all()
+                 if re.sub(r"\s+", " ", o.name.strip()).lower() == key),
+                None,
+            )
+        else:
+            org = None
+            typed = user.full_name.strip() or user.email
+
+        if org is None:
+            base = slugify(typed)[:150] or "org"
+            slug, n = base, 2
+            while cls.objects.filter(slug=slug).exists():
+                slug = f"{base}-{n}"
+                n += 1
+            org = cls.objects.create(name=typed, slug=slug)
+            role = OrganisationMember.Role.OWNER
+        else:
+            # Joining a company somebody else already registered. A member, not
+            # an owner: matching a typed company name is not proof of authority
+            # over it, and an owner can promote them.
+            role = OrganisationMember.Role.MEMBER
+
+        OrganisationMember.objects.get_or_create(
+            organisation=org, user=user, defaults={"role": role}
+        )
+        return org
+
+
+class OrganisationMember(models.Model):
+    """Somebody's seat at a client organisation.
+
+    Three roles, and the distinction that matters is **billing**: a finance
+    contact needs to see what things cost and nothing else. Handing them the
+    brief, the deliverables and the team's progress updates because they have
+    to pay an invoice is the sort of over-sharing that stops a buyer rolling
+    the platform out past one team.
+    """
+
+    class Role(models.TextChoices):
+        OWNER = "owner", "Owner"
+        MEMBER = "member", "Member"
+        BILLING = "billing", "Billing only"
+
+    organisation = models.ForeignKey(
+        Organisation, on_delete=models.CASCADE, related_name="memberships"
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+        related_name="organisation_memberships",
+    )
+    role = models.CharField(max_length=10, choices=Role.choices, default=Role.MEMBER)
+    invited_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="organisation_invites_sent",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["organisation__name", "user__full_name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["organisation", "user"], name="unique_org_membership"
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.user} · {self.organisation} ({self.role})"
+
+    @property
+    def sees_delivery(self):
+        """Whether this seat sees the work itself, or only what it cost."""
+        return self.role != self.Role.BILLING
+
+
+class TermsAcceptance(models.Model):
+    """A record that somebody agreed to the terms, and which version.
+
+    The platform's structural defence against people taking the relationship
+    off-platform is genuinely strong — a client never chooses their expert,
+    often doesn't know who did the work, and the relationship belongs to the
+    delivery lead. But "stronger than a marketplace's" isn't "handled", and
+    there was no stated position at all.
+
+    Versioned, because terms change and "they agreed" is worthless without
+    "to what". Re-prompting on a new version is the point of storing it.
+    """
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+        related_name="terms_acceptances",
+    )
+    version = models.CharField(max_length=20)
+    accepted_at = models.DateTimeField(auto_now_add=True)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-accepted_at", "-id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "version"], name="unique_terms_acceptance"
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.user_id} accepted {self.version}"

@@ -6,7 +6,7 @@ from pathlib import Path
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import F, Q
 from django.http import FileResponse, Http404
 from django.utils import timezone
 
@@ -24,16 +24,30 @@ from .access import (
     leads_project,
     visible_projects,
 )
-from .models import Activity, Attachment, Project, Task
+from .models import (
+    Activity,
+    Attachment,
+    ChangeOrder,
+    Engagement,
+    Project,
+    ProjectFeedback,
+    RevisionRequest,
+    Task,
+)
 from .serializers import (
     ActivityCreateSerializer,
     AssignSerializer,
     AttachmentCreateSerializer,
     AttachmentSerializer,
+    ChangeOrderCreateSerializer,
+    ChangeOrderSerializer,
+    EngagementCreateSerializer,
+    EngagementSerializer,
     ExpertListSerializer,
     ProjectCreateSerializer,
     ProjectDetailSerializer,
     ProjectEditSerializer,
+    ProjectFeedbackSerializer,
     ProjectListSerializer,
     QuoteSerializer,
     TaskEditSerializer,
@@ -103,6 +117,16 @@ def credit_earnings(project):
     except Exception as exc:  # noqa: BLE001 - approval must not fail on payout math
         logger.error("crediting earnings for %s failed: %s", project.code, exc)
         return
+    # Earmark the platform's refund reserve from what it kept on this project.
+    # After crediting, deliberately: the reserve is a slice of the *remainder*,
+    # so it can't be worked out until everyone else has been paid. Wrapped
+    # separately so a reserve failure can't cost anyone their earning.
+    try:
+        from payments import refunds as refund_service
+
+        refund_service.contribute(project)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("reserve contribution for %s failed: %s", project.code, exc)
     for earning in credited:
         payout_notifications.notify_earning_credited(
             earning.user, project, earning.amount_usd
@@ -144,7 +168,8 @@ class ProjectViewSet(mixins.ListModelMixin,
         base = Project.objects.select_related(
             "client", "expert", "product_line", "service"
         ).prefetch_related("experts", "tasks", "activity",
-                           "activity__attachments", "attachments")
+                           "activity__attachments", "activity__replies",
+                           "activity__replies__attachments", "attachments")
         if user.is_superuser:
             return base
         if user.role == Role.DELIVERY_LEAD:
@@ -163,7 +188,15 @@ class ProjectViewSet(mixins.ListModelMixin,
             # expert. The two are kept in step, but an admin editing a project
             # directly can set one without the other.
             return base.filter(Q(experts=user) | Q(expert=user)).distinct()
-        return base.filter(client=user)
+        # A client sees their own briefs plus everything their company has
+        # bought. `client=user` stays in the clause rather than being replaced
+        # by the org lookup: a project posted before organisations existed, or
+        # one an admin created directly, may have no organisation at all, and
+        # its author must never lose sight of it.
+        orgs = user.organisation_memberships.values_list("organisation_id", flat=True)
+        return base.filter(
+            Q(client=user) | Q(organisation__in=list(orgs))
+        ).distinct()
 
     def get_serializer_class(self):
         if self.action == "list":
@@ -179,11 +212,19 @@ class ProjectViewSet(mixins.ListModelMixin,
         aren't in that cache, so we re-fetch to return current data.
         """
         fresh = Project.objects.select_related(
-            "client", "expert", "product_line", "service"
+            "client", "expert", "product_line", "service", "feedback"
         ).prefetch_related(
-            "experts", "tasks", "activity", "activity__attachments", "attachments"
+            "experts", "tasks", "activity", "activity__attachments",
+            "activity__replies", "activity__replies__attachments", "attachments",
+            "change_orders", "revision_requests", "refunds", "payments",
         ).get(pk=project.pk)
-        return Response(ProjectDetailSerializer(fresh).data, status=status_code)
+        # The request has to reach the serializer: who may read the client's
+        # private feedback is decided from it. Without this everyone — including
+        # the lead it's written for — sees null.
+        return Response(
+            ProjectDetailSerializer(fresh, context={"request": self.request}).data,
+            status=status_code,
+        )
 
     def create(self, request, *args, **kwargs):
         if request.user.role != Role.CLIENT:
@@ -191,9 +232,24 @@ class ProjectViewSet(mixins.ListModelMixin,
         serializer = ProjectCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         references = serializer.validated_data.pop("references", [])
+        # Attach the brief to the company that's buying it, so colleagues can
+        # see it. A billing-only seat may not post — they're here to settle
+        # invoices, not to commission work.
+        seat = request.user.organisation_memberships.select_related(
+            "organisation").first()
+        if seat and not seat.sees_delivery:
+            raise PermissionDenied(
+                "Your seat at this company is billing-only, so you can't post a "
+                "brief. Ask an owner to change your access."
+            )
+        organisation = seat.organisation if seat else None
         project = serializer.save(
             client=request.user,
-            company=request.user.company,
+            organisation=organisation,
+            # The company name at the time of posting, exactly as `category`
+            # snapshots the service — a later rename must not rewrite an
+            # invoice that has already been settled.
+            company=(organisation.name if organisation else request.user.company),
             stage=Stage.SUBMITTED,
             # Attribution follows the client's referral. It stays editable by a
             # lead until the client pays, and is locked from then on.
@@ -576,11 +632,60 @@ class ProjectViewSet(mixins.ListModelMixin,
             raise ValidationError("This project isn't in progress.")
         project.stage = Stage.REVIEW
         project.save(update_fields=["stage"])
-        text = ("Submitted the work for client review."
-                if is_assigned_expert else
-                "Moved the project to review and notified the client.")
+        # Resubmitting is what answers an outstanding revision request. Closing
+        # it here rather than making the team tick something off means the two
+        # can't disagree — the work is back with the client either way.
+        resubmission = project.revision_requests.filter(
+            resolved_at__isnull=True).update(resolved_at=timezone.now())
+        if resubmission:
+            text = "Made the requested changes and sent the work back for review."
+        else:
+            text = ("Submitted the work for client review."
+                    if is_assigned_expert else
+                    "Moved the project to review and notified the client.")
         log_activity(project, request.user, text)
-        notifications.notify_submitted_for_review(project)
+        notifications.notify_submitted_for_review(
+            project, is_resubmission=bool(resubmission))
+        return self._detail(project)
+
+    @action(detail=True, methods=["post"], url_path="request-changes")
+    def request_changes(self, request, pk=None):
+        """Send delivered work back to the team, with a reason.
+
+        The second exit from Review, and the one that was missing: until now a
+        client who wasn't happy could only decline to click Approve, which
+        communicated nothing and left the project parked.
+
+        Money already released is deliberately untouched. Tasks the lead
+        approved were paid from cash the client settled up front, and unwinding
+        them here would turn every revision into a payment dispute. Rework is
+        new tasks or reopened ones; a genuine failure is a refund (a different
+        action, with its own decision).
+        """
+        project = self.get_object()
+        is_client = (request.user.role == Role.CLIENT
+                     and project.client_id == request.user.id)
+        if not (is_client or request.user.is_superuser):
+            raise PermissionDenied("Only the client can ask for changes.")
+        if project.stage != Stage.REVIEW:
+            raise ValidationError(
+                "There's nothing to send back — this project isn't in review."
+            )
+        note = (request.data.get("note") or "").strip()
+        if not note:
+            raise ValidationError(
+                "Say what needs changing, so the team knows what to fix."
+            )
+
+        revision = RevisionRequest.objects.create(
+            project=project, requested_by=request.user, note=note)
+        project.stage = Stage.IN_PROGRESS
+        project.revision_rounds = F("revision_rounds") + 1
+        project.save(update_fields=["stage", "revision_rounds"])
+        project.refresh_from_db(fields=["revision_rounds"])
+
+        log_activity(project, request.user, note, kind=Activity.Kind.REVISION)
+        notifications.notify_changes_requested(project, revision)
         return self._detail(project)
 
     @action(detail=True, methods=["post"], url_path="remind-review")
@@ -593,17 +698,56 @@ class ProjectViewSet(mixins.ListModelMixin,
             raise PermissionDenied("Only the delivery team can send that reminder.")
         if project.stage != Stage.REVIEW:
             raise ValidationError("This project isn't waiting on the client's review.")
+        # The first reminder starts the clock on closing this over a silent
+        # client's head. Later reminders don't restart it — otherwise nudging
+        # again would postpone the team's own payday.
+        if not project.review_reminded_at:
+            project.review_reminded_at = timezone.now()
+            project.save(update_fields=["review_reminded_at"])
         log_activity(project, request.user,
                      "Reminded the client that the work is ready for review.")
         notifications.notify_review_reminder(project)
+        return self._detail(project)
+
+    def _complete(self, project, actor, *, by_client, countersigner=None):
+        """Close a project out and release every earning on it. One path only.
+
+        Completion is the single most consequential action in the product — it
+        is what turns a quote into other people's money — so both routes to it
+        run through here rather than each doing their own bookkeeping.
+        """
+        project.stage = Stage.COMPLETED
+        project.completed_at = timezone.now()
+        project.completed_by = actor
+        project.countersigned_by = countersigner
+        project.save(update_fields=["stage", "completed_at", "completed_by",
+                                    "countersigned_by"])
+        if by_client:
+            text = "Approved delivery. Project complete!"
+        elif countersigner:
+            name = countersigner.full_name or countersigner.email
+            text = f"Marked the project complete on the client's behalf, countersigned by {name}."
+        else:
+            text = ("Marked the project complete on the client's behalf, after "
+                    "the client went quiet.")
+        log_activity(project, actor, text)
+        notifications.notify_project_completed(project, completed_by_client=by_client)
+        credit_earnings(project)
         return self._detail(project)
 
     @action(detail=True, methods=["post"])
     def approve(self, request, pk=None):
         """Close the project out and release the earnings.
 
-        The client signs their own work off; a delivery lead can also complete it
-        — needed when a client goes quiet and the team is owed their share.
+        The client signs their own work off, always, with no conditions.
+
+        A delivery lead can also complete it, because a client who stops
+        replying must not be able to strand the team's money indefinitely — but
+        not instantly and not silently. That path now requires the client to
+        have been reminded, to have actually gone quiet since, and to have no
+        outstanding change request. Otherwise a lead could take payment for work
+        the client had just rejected, which is the same shape of problem the
+        two-person rule already solves for withdrawals.
         """
         project = self.get_object()
         is_client = (request.user.role == Role.CLIENT
@@ -612,26 +756,220 @@ class ProjectViewSet(mixins.ListModelMixin,
             raise PermissionDenied("Only the client or a delivery lead can complete this.")
         if project.stage != Stage.REVIEW:
             raise ValidationError("This project isn't ready for approval.")
-        project.stage = Stage.COMPLETED
-        project.completed_at = timezone.now()
-        project.save(update_fields=["stage", "completed_at"])
-        text = ("Approved delivery. Project complete!"
-                if is_client else
-                "Marked the project complete on the client's behalf.")
-        log_activity(project, request.user, text)
-        notifications.notify_project_completed(project, completed_by_client=is_client)
-        credit_earnings(project)
+        if not is_client:
+            blocked = project.client_silence_block()
+            if blocked:
+                raise PermissionDenied(blocked)
+        return self._complete(project, request.user, by_client=is_client)
+
+    @action(detail=True, methods=["post"])
+    def feedback(self, request, pk=None):
+        """The client's verdict, once, on work that has finished.
+
+        Only after the project is closed — either signed off or cancelled.
+        Asking mid-delivery gets you a progress report, not a verdict, and a
+        client who has already told you it's a 2 has no reason to keep working
+        with the team on fixing it.
+        """
+        project = self.get_object()
+        if project.client_id != request.user.id:
+            raise PermissionDenied("Only the client can leave feedback.")
+        if project.stage not in Project.CLOSED_STAGES:
+            raise ValidationError(
+                "There's nothing to rate yet — this project is still running."
+            )
+        if hasattr(project, "feedback"):
+            raise ValidationError("You've already left feedback on this project.")
+        serializer = ProjectFeedbackSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save(project=project)
+        # Not written to the activity feed on purpose: the feed is read by the
+        # experts, and this is the client's private word to the lead.
+        notifications.notify_feedback_left(project, serializer.instance)
         return self._detail(project)
+
+    @action(detail=True, methods=["get", "post"], url_path="change-orders")
+    def change_orders(self, request, pk=None):
+        """Extra scope on a project the client has already paid for.
+
+        GET is open to anyone on the project — the client is being asked to pay
+        for these, so they can hardly be hidden from them. POST is the lead's:
+        pricing scope is their job, and it's their expert pool that grows.
+        """
+        project = self.get_object()
+        if request.method == "GET":
+            return Response(ChangeOrderSerializer(
+                project.change_orders.all(), many=True).data)
+
+        self._require_lead()
+        if not leads_project(request.user, project):
+            raise PermissionDenied("Only this project's delivery lead can add scope.")
+        # Live paid work only. Before payment there's nothing to add to — edit
+        # the quote. After completion the earnings are snapshotted, so extra
+        # contract value would make the split disagree with the ledger.
+        if project.stage not in (Stage.PAID, Stage.IN_PROGRESS, Stage.REVIEW):
+            raise ValidationError(
+                "Extra scope can only be added to a paid project that's still "
+                "running. Re-price the quote instead, or raise a new brief."
+            )
+        serializer = ChangeOrderCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        order = ChangeOrder.objects.create(
+            project=project, raised_by=request.user,
+            **serializer.validated_data,
+        )
+        log_activity(
+            project, request.user,
+            f"Raised a change order for ${order.amount_usd:,.2f}: {order.description}",
+        )
+        notifications.notify_change_order_raised(project, order)
+        return Response(ChangeOrderSerializer(order).data,
+                        status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, pk=None):
+        """Stop a project for good, and decide about the money in the same breath.
+
+        Two quite different situations wear the same word. Before payment,
+        cancelling is housekeeping — the client changed their mind, nothing has
+        moved, anyone involved can call it off. After payment there is real
+        cash against the project, so cancelling is a financial act: it's
+        restricted to the delivery side, and it requires an explicit refund
+        figure even when that figure is zero.
+
+        Requiring the zero is the point. A cancelled paid project with no
+        refund decision recorded is the exact state where a client believes
+        they're owed something and the platform has no note of it.
+        """
+        project = self.get_object()
+        if project.stage in Project.CLOSED_STAGES:
+            raise ValidationError(
+                f"This project is already {project.stage.lower()}."
+            )
+
+        is_client = (request.user.role == Role.CLIENT
+                     and project.client_id == request.user.id)
+        reason = (request.data.get("reason") or "").strip()
+        if not reason:
+            raise ValidationError("Say why this project is being cancelled.")
+
+        if not project.is_paid:
+            if not (is_client or self._is_lead()):
+                raise PermissionDenied("Only the client or a delivery lead can cancel this.")
+            refund = None
+        else:
+            if not self._is_lead():
+                raise PermissionDenied(
+                    "This project has been paid for, so a delivery lead has to "
+                    "cancel it and settle the refund. Ask your delivery lead."
+                )
+            raw = request.data.get("refund_usd")
+            if raw is None or str(raw).strip() == "":
+                raise ValidationError(
+                    "Decide what to refund before cancelling a paid project. "
+                    "Send refund_usd: 0 if nothing is owed."
+                )
+            try:
+                amount = Decimal(str(raw))
+            except (TypeError, ArithmeticError, ValueError):
+                raise ValidationError("That refund amount isn't a number.")
+            refund = self._raise_refund(project, request.user, amount, reason) \
+                if amount > 0 else None
+
+        project.stage = Stage.CANCELLED
+        project.cancelled_at = timezone.now()
+        project.cancelled_by = request.user
+        project.cancellation_reason = reason
+        project.save(update_fields=["stage", "cancelled_at", "cancelled_by",
+                                    "cancellation_reason"])
+        who = "the client" if is_client else "the delivery team"
+        note = f"Cancelled the project ({who}): {reason}"
+        if refund:
+            note += f" A refund of ${refund.amount_usd:,.2f} was raised."
+        log_activity(project, request.user, note)
+        notifications.notify_project_cancelled(project, refund=refund)
+        return self._detail(project)
+
+    def _raise_refund(self, project, user, amount, reason):
+        """Create a refund from a lifecycle action, translating service errors."""
+        from payments import refunds as refund_service
+
+        try:
+            return refund_service.request_refund(project, user, amount, reason)
+        except refund_service.RefundError as exc:
+            raise ValidationError(str(exc))
+
+    @action(detail=True, methods=["post"], url_path="countersign-completion")
+    def countersign_completion(self, request, pk=None):
+        """An administrator authorising completion without the wait.
+
+        The escape hatch from the silence window, and the reason the window can
+        afford to be strict: a genuinely abandoned project doesn't have to sit
+        for a week, it just needs somebody with no stake in the lead share to
+        agree.
+
+        Administrators rather than peer leads, deliberately. The obvious design
+        was a second delivery lead, but `access.visible_projects` hides a lead's
+        project from every other lead on purpose — running the same discipline
+        is not a reason to see someone else's client's budget. Routing the
+        second pair of eyes through an admin, who can already see everything,
+        gets the two-person rule without quietly widening that boundary. It
+        also matches how settling withdrawals already works.
+        """
+        project = self.get_object()
+        if not request.user.is_superuser:
+            raise PermissionDenied(
+                "Only an administrator can countersign a completion. Otherwise "
+                "the project completes on its own once the client has been "
+                "silent for the configured number of days."
+            )
+        if project.stage != Stage.REVIEW:
+            raise ValidationError("This project isn't ready for approval.")
+        if request.user.id == project.lead_id:
+            raise PermissionDenied(
+                "Countersigning is a second pair of eyes — it can't be your own. "
+                "This is your project, so the silence window applies to you too."
+            )
+        # A countersignature overrides the wait, never the client's own words.
+        if project.open_revision:
+            raise PermissionDenied(
+                "The client has asked for changes. Make them and resubmit — no "
+                "countersignature can complete a project over an open change request."
+            )
+        lead = project.lead or request.user
+        return self._complete(project, lead, by_client=False,
+                              countersigner=request.user)
 
     @action(detail=True, methods=["post"])
     def activity(self, request, pk=None):
+        """Post an update, reply to one, or comment on a deliverable.
+
+        All three through one endpoint, because they are the same act with
+        different context. A reply carries `parent`; a comment about a specific
+        file carries `attachment`; a plain update carries neither.
+        """
         project = self.get_object()
         serializer = ActivityCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         text = serializer.validated_data["text"].strip()
         if not text:
             raise ValidationError("Write an update first.")
-        entry = log_activity(project, request.user, text, kind=serializer.validated_data["kind"])
+
+        parent = self._resolve_parent(project, serializer.validated_data.get("parent"))
+        anchor = self._resolve_anchor(
+            project, serializer.validated_data.get("attachment"))
+        # A reply is a reply, not a Blocker or a Milestone. Typed kinds classify
+        # the state of the work; a response inside a thread doesn't, and letting
+        # one be typed would put a second Blocker chip in the feed for a comment
+        # agreeing with the first.
+        kind = (Activity.Kind.UPDATE if parent
+                else serializer.validated_data["kind"])
+
+        entry = log_activity(project, request.user, text, kind=kind)
+        if parent or anchor:
+            entry.parent = parent
+            entry.attachment = anchor
+            entry.save(update_fields=["parent", "attachment"])
         for link in serializer.validated_data.get("attachments", []):
             Attachment.objects.create(
                 project=project, activity=entry, url=link["url"],
@@ -640,6 +978,30 @@ class ProjectViewSet(mixins.ListModelMixin,
             )
         notifications.notify_update_posted(project, entry)
         return self._detail(project)
+
+    def _resolve_parent(self, project, parent_id):
+        """The entry being replied to, flattened to one level.
+
+        Replying to a reply attaches to its parent rather than nesting. The feed
+        stays two levels deep whatever the client sends, so the renderer never
+        has to handle a tree and `thread_emails` never has to walk one.
+        """
+        if not parent_id:
+            return None
+        parent = project.activity.filter(id=parent_id).first()
+        if not parent:
+            # Deliberately not a 404 about the id: an activity on someone
+            # else's project is not this caller's business to confirm exists.
+            raise ValidationError("That update isn't on this project.")
+        return parent.parent or parent
+
+    def _resolve_anchor(self, project, attachment_id):
+        if not attachment_id:
+            return None
+        anchor = project.attachments.filter(id=attachment_id).first()
+        if not anchor:
+            raise ValidationError("That file isn't on this project.")
+        return anchor
 
     @action(detail=True, methods=["post"])
     def attachments(self, request, pk=None):
@@ -1255,4 +1617,201 @@ def reports(request):
     if user.is_superuser:
         payload["business_developers"] = reporting.business_developers()
         payload["delivery_leads"] = reporting.delivery_leads()
+        # The reserve sits next to `in_flight_paid_usd` on purpose: one is the
+        # exposure, the other is what's set aside against it, and reading
+        # either without the other tells you half the story. Admin-only — it's
+        # a platform-wide pot, not a per-line figure a lead can act on.
+        from payments import refunds as refund_service
+        from payments.models import Refund
+
+        settled = Refund.objects.filter(status=Refund.Status.PROCESSED)
+        payload["reserve"] = {
+            "balance_usd": str(refund_service.reserve_balance()),
+            "refunded_usd": str(sum((r.amount_usd for r in settled), Decimal("0"))),
+            "absorbed_usd": str(sum((r.absorbed_usd for r in settled), Decimal("0"))),
+            "pending_count": Refund.objects.filter(
+                status=Refund.Status.REQUESTED).count(),
+        }
     return Response(payload)
+
+
+@api_view(["DELETE"])
+@permission_classes([IsAuthenticated])
+def withdraw_change_order(request, order_id):
+    """Take back a change order the client hasn't paid yet.
+
+    Only while unpaid. A paid one is contract value the pool has already been
+    grown by and tasks may already be priced against — unwinding that is a
+    refund, not a deletion.
+    """
+    order = (ChangeOrder.objects
+             .select_related("project").filter(id=order_id).first())
+    if not order:
+        return Response({"detail": "No change order with that id."},
+                        status=status.HTTP_404_NOT_FOUND)
+    if not (leads_project(request.user, order.project) or request.user.is_superuser):
+        raise PermissionDenied("Only this project's delivery lead can withdraw it.")
+    if order.status == ChangeOrder.Status.PAID:
+        raise ValidationError(
+            "The client has already paid for this. Refund it instead."
+        )
+    order.status = ChangeOrder.Status.WITHDRAWN
+    order.save(update_fields=["status"])
+    log_activity(order.project, request.user,
+                 f"Withdrew the ${order.amount_usd:,.2f} change order.")
+    return Response(ChangeOrderSerializer(order).data)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def utilisation(request):
+    """How much of an expert's available time has had paid work on it.
+
+    Three audiences, three scopes, one endpoint:
+
+    * an **expert** sees their own — this is the retention surface, and the
+      honest answer to "am I better off here than bidding for myself?";
+    * a **delivery lead** sees their roster, worst first, so idle capacity
+      surfaces before somebody quits over it;
+    * an **admin** additionally gets the platform figure, which is the number
+      to recruit on.
+    """
+    from . import utilisation as util
+
+    user = request.user
+    start, end = util.default_window()
+    if user.role == Role.EXPERT:
+        return Response({"start": str(start), "end": str(end),
+                         "me": util.for_expert(user, start, end)})
+    if user.role == Role.DELIVERY_LEAD or user.is_superuser:
+        payload = util.for_roster(user, start, end)
+        if user.is_superuser:
+            payload["platform"] = util.platform(start, end)
+        return Response(payload)
+    raise PermissionDenied("Utilisation is for experts and delivery leads.")
+
+
+# ---------------------------------------------------------------------------
+# Engagements — retainers billed monthly
+# ---------------------------------------------------------------------------
+
+def _visible_engagements(user):
+    """Whose retainers this person can see, mirroring project scope.
+
+    A lead sees the ones they run; a client sees their company's; an expert
+    sees the ones they're actually delivering, found through the cycles rather
+    than a second membership list that could drift from the first.
+    """
+    base = Engagement.objects.select_related(
+        "organisation", "client", "lead", "product_line", "service"
+    ).prefetch_related("cycles")
+    if user.is_superuser:
+        return base
+    if user.role == Role.DELIVERY_LEAD:
+        return base.filter(lead=user)
+    if user.role == Role.EXPERT:
+        return base.filter(
+            Q(cycles__experts=user) | Q(cycles__expert=user)).distinct()
+    orgs = user.organisation_memberships.values_list("organisation_id", flat=True)
+    return base.filter(
+        Q(client=user) | Q(organisation__in=list(orgs))).distinct()
+
+
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def engagements(request):
+    """List retainers, or (delivery lead) set one up.
+
+    A lead creates these rather than a client, for the same reason a lead
+    quotes a brief: the price and the scope of an ongoing seat are negotiated,
+    not self-served.
+    """
+    if request.method == "GET":
+        return Response(EngagementSerializer(
+            _visible_engagements(request.user), many=True).data)
+
+    if request.user.role != Role.DELIVERY_LEAD and not request.user.is_superuser:
+        raise PermissionDenied("Only a delivery lead can set up a retainer.")
+    if not request.user.is_approved:
+        raise PermissionDenied("Your delivery lead account is still being reviewed.")
+
+    serializer = EngagementCreateSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    client = serializer.validated_data["client"]
+    if client.role != Role.CLIENT:
+        raise ValidationError("A retainer is bought by a client.")
+    seat = client.organisation_memberships.select_related("organisation").first()
+    if not seat:
+        raise ValidationError(
+            "That client isn't attached to a company yet, and a retainer bills "
+            "to one."
+        )
+    engagement = serializer.save(lead=request.user, organisation=seat.organisation)
+    return Response(EngagementSerializer(engagement).data,
+                    status=status.HTTP_201_CREATED)
+
+
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def engagement_detail(request, engagement_id):
+    """Read one retainer, or act on it: pause, resume, end, or raise a cycle."""
+    engagement = _visible_engagements(request.user).filter(id=engagement_id).first()
+    if not engagement:
+        return Response({"detail": "No retainer with that id."},
+                        status=status.HTTP_404_NOT_FOUND)
+
+    if request.method == "GET":
+        return Response(EngagementSerializer(engagement).data)
+
+    runs_it = (request.user.is_superuser
+               or (request.user.role == Role.DELIVERY_LEAD
+                   and engagement.lead_id == request.user.id))
+    if not runs_it:
+        raise PermissionDenied("Only this retainer's delivery lead can change it.")
+
+    action_name = (request.data.get("action") or "").strip()
+    if action_name == "pause":
+        engagement.status = Engagement.Status.PAUSED
+        engagement.save(update_fields=["status"])
+    elif action_name == "resume":
+        if engagement.status == Engagement.Status.ENDED:
+            raise ValidationError("An ended retainer can't be resumed — set up a new one.")
+        engagement.status = Engagement.Status.ACTIVE
+        engagement.save(update_fields=["status"])
+    elif action_name == "end":
+        reason = (request.data.get("reason") or "").strip()
+        if not reason:
+            raise ValidationError("Say why the retainer is ending.")
+        engagement.status = Engagement.Status.ENDED
+        engagement.ended_at = timezone.now()
+        engagement.end_reason = reason
+        engagement.save(update_fields=["status", "ended_at", "end_reason"])
+        # A month already paid for is delivered. Ending stops future billing;
+        # it does not cancel work the client has settled.
+        latest = engagement.cycles.order_by("-period_start").first()
+        notifications.notify_engagement_ended(engagement, final_cycle=latest)
+    elif action_name == "raise-cycle":
+        # The manual path, for a retainer set up mid-month that shouldn't wait
+        # for the scheduler. It skips only the lead-time window — every other
+        # guard still applies, or a lead clicking twice would bill a client
+        # months in advance.
+        from . import engagements as service
+
+        if not engagement.is_live:
+            raise ValidationError(
+                f"This retainer is {engagement.get_status_display().lower()}.")
+        blocked = service.blocking_cycle(engagement)
+        if blocked:
+            raise ValidationError(
+                f"{blocked.period_start:%B}'s cycle hasn't been paid yet. "
+                "Chase that before raising another."
+            )
+        cycle = service.generate_cycle(engagement)
+        if cycle is None:
+            raise ValidationError("That period has already been raised.")
+        service._announce(cycle)
+    else:
+        raise ValidationError("Pick an action: pause, resume, end, or raise-cycle.")
+
+    engagement.refresh_from_db()
+    return Response(EngagementSerializer(engagement).data)

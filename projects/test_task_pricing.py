@@ -46,12 +46,16 @@ class TaskPricingTests(TestCase):
         self.customer = User.objects.create_user(
             "priceclient@acme.io", "x", role=User.Role.CLIENT)
 
-        # $5,000 quote → $3,000 expert pool at the default 60%.
+        # $5,000 quote. The pool is whatever the configured expert share makes
+        # it — read from the project below rather than written in here, so a
+        # change to the policy moves these tests with it instead of breaking
+        # them. What's under test is the allocation guard, not the percentage.
         self.project = Project.objects.create(
             title="A rebrand", client=self.customer, category="Brand identity",
             description="…", product_line=self.line, lead=self.lead,
             expert=self.ada, stage=Project.Stage.IN_PROGRESS, quote_usd=5000)
         self.project.experts.add(self.ada, self.chidi)
+        self.pool = self.project.expert_pool_usd
 
     def create(self, user=None, **payload):
         payload.setdefault("title", "A task")
@@ -82,9 +86,11 @@ class TaskPricingTests(TestCase):
             text__contains="$800.00").exists())
 
     def test_tasks_can_be_split_across_the_team(self):
-        self.create(title="Design", assignee=self.ada.id, amount_usd="1800.00")
-        self.create(title="Build", assignee=self.chidi.id, amount_usd="1200.00")
-        self.assertEqual(self.project.allocated_usd, Decimal("3000.00"))
+        half = (self.pool / 2).quantize(Decimal("0.01"))
+        self.create(title="Design", assignee=self.ada.id, amount_usd=str(half))
+        self.create(title="Build", assignee=self.chidi.id,
+                    amount_usd=str(self.pool - half))
+        self.assertEqual(self.project.allocated_usd, self.pool)
         self.assertEqual(self.project.unallocated_usd, Decimal("0.00"))
         self.assertTrue(self.project.uses_task_payouts)
 
@@ -103,37 +109,41 @@ class TaskPricingTests(TestCase):
     def test_the_pool_can_be_allocated_exactly(self):
         """The boundary is inclusive — allocating the lot is the normal case."""
         response = self.create(title="Everything", assignee=self.ada.id,
-                               amount_usd="3000.00")
+                               amount_usd=str(self.pool))
         self.assertEqual(response.status_code, 201)
         self.assertEqual(self.project.unallocated_usd, Decimal("0.00"))
 
     def test_one_cent_over_the_pool_is_refused(self):
         response = self.create(title="Too much", assignee=self.ada.id,
-                               amount_usd="3000.01")
+                               amount_usd=str(self.pool + Decimal("0.01")))
         self.assertEqual(response.status_code, 400)
         self.assertIn("unallocated", str(response.data))
         self.assertEqual(self.project.tasks.count(), 0)
 
     def test_the_guard_counts_what_is_already_allocated(self):
-        self.create(title="First", assignee=self.ada.id, amount_usd="2500.00")
+        first = self.pool - Decimal("500.00")
+        self.create(title="First", assignee=self.ada.id, amount_usd=str(first))
         response = self.create(title="Second", assignee=self.chidi.id,
                                amount_usd="600.00")
         self.assertEqual(response.status_code, 400)
-        self.assertEqual(self.project.allocated_usd, Decimal("2500.00"))
+        self.assertEqual(self.project.allocated_usd, first)
 
     def test_editing_a_task_frees_its_own_old_amount(self):
-        """Otherwise re-pricing the only task from $3,000 to $2,900 would look
-        like asking for $5,900."""
+        """Otherwise re-pricing the only task down by $100 would look like
+        asking for the pool plus the amount it already held."""
         task = Task.objects.get(id=self.create(
-            title="All of it", assignee=self.ada.id, amount_usd="3000.00").data["id"])
-        response = self.edit(task, amount_usd="2900.00")
+            title="All of it", assignee=self.ada.id,
+            amount_usd=str(self.pool)).data["id"])
+        lower = self.pool - Decimal("100.00")
+        response = self.edit(task, amount_usd=str(lower))
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(self.project.allocated_usd, Decimal("2900.00"))
+        self.assertEqual(self.project.allocated_usd, lower)
 
     def test_editing_a_task_beyond_the_pool_is_still_refused(self):
         task = Task.objects.get(id=self.create(
             title="Some", assignee=self.ada.id, amount_usd="1000.00").data["id"])
-        self.assertEqual(self.edit(task, amount_usd="3100.00").status_code, 400)
+        over = self.pool + Decimal("100.00")
+        self.assertEqual(self.edit(task, amount_usd=str(over)).status_code, 400)
         task.refresh_from_db()
         self.assertEqual(task.amount_usd, Decimal("1000.00"))
 
@@ -248,9 +258,10 @@ class TaskPricingTests(TestCase):
     def test_the_project_reports_its_allocation(self):
         self.create(title="Design", assignee=self.ada.id, amount_usd="1800.00")
         data = as_user(self.lead).get(f"/api/projects/{self.project.id}").data
-        self.assertEqual(data["expert_pool_usd"], "3000.00")
+        self.assertEqual(data["expert_pool_usd"], str(self.pool))
         self.assertEqual(data["allocated_usd"], "1800.00")
-        self.assertEqual(data["unallocated_usd"], "1200.00")
+        self.assertEqual(data["unallocated_usd"],
+                         str(self.pool - Decimal("1800.00")))
         self.assertTrue(data["uses_task_payouts"])
 
 

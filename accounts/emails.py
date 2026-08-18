@@ -32,6 +32,9 @@ def send_verification_email(user):
             "This link expires in 24 hours.",
         ],
         cta=("Verify my email", link),
+        # Pre-login mail: the recipient isn't signed in, and a bell entry
+        # saying "confirm your email" is meaningless to somebody who is.
+        notify=False,
     )
     return token
 
@@ -49,6 +52,9 @@ def send_password_reset_email(user):
             "This link expires in 24 hours. If you didn't request this, you can safely ignore this email.",
         ],
         cta=("Reset password", link),
+        # Pre-login mail: the recipient isn't signed in, and a bell entry
+        # saying "confirm your email" is meaningless to somebody who is.
+        notify=False,
     )
     return token
 
@@ -157,6 +163,8 @@ def send_expert_invitation(invitation):
         heading="You've been invited to deliver with Ripple",
         paragraphs=paragraphs,
         cta=("Accept the invitation", link),
+        # The invitee has no account yet — there is nowhere to put a bell.
+        notify=False,
     )
 
 
@@ -327,4 +335,68 @@ def notify_roster_changed(expert, new_lead, previous_lead=None):
                 "Any project of yours they're already on is unaffected — they "
                 "stay on it, and anything they've earned is theirs.",
             ],
+        )
+
+
+def notify_added_to_organisation(membership):
+    """Tell somebody they now see their company's projects.
+
+    Worth saying plainly: being added to a company means seeing briefs, budgets
+    and deliverables they couldn't see yesterday. Somebody who didn't expect
+    that should find out from us rather than by noticing.
+    """
+    org = membership.organisation
+    billing_only = membership.role == membership.Role.BILLING
+    send_brand_email(
+        subject=f"You've been added to {org.name}",
+        to=membership.user.email,
+        heading=f"You're now part of {org.name}",
+        paragraphs=[
+            f"Hi {_first_name(membership.user)},",
+            f"{(membership.invited_by and (membership.invited_by.full_name or membership.invited_by.email)) or 'An owner'} "
+            f"has added you to {org.name} on Ripple Innovation Labs.",
+            ("You'll see invoices and what projects cost. The briefs and "
+             "delivered work stay with the project team."
+             if billing_only else
+             "You can now see the projects your company has commissioned, "
+             "follow their progress, and post new briefs."),
+        ],
+        cta=("Open your projects", _link("/projects")),
+    )
+
+
+def notify_lead_offboarded(leaving, successor, projects_moved, experts_moved):
+    """Tell both leads, and the experts, that the roster has changed hands.
+
+    The experts matter most here: their delivery lead is who assigns them work
+    and approves their payments, and finding out that changed by noticing is a
+    bad way to learn it.
+    """
+    successor_name = successor.full_name or successor.email
+    send_brand_email(
+        subject=f"{leaving.full_name or leaving.email}'s work has moved to you",
+        to=successor.email,
+        heading="A delivery lead's book has moved to you",
+        paragraphs=[
+            f"Hi {_first_name(successor)},",
+            f"{leaving.full_name or leaving.email} has left, and their work is "
+            f"now yours: {experts_moved} expert(s) on the roster and "
+            f"{projects_moved} live project(s).",
+            "Completed work stays with whoever delivered it, and nobody's "
+            "earnings have changed.",
+        ],
+        cta=("Open the delivery board", _link("/board")),
+    )
+    for expert in successor.team_members.filter(lead=successor):
+        send_brand_email(
+            subject="Your delivery lead has changed",
+            to=expert.email,
+            heading="You have a new delivery lead",
+            paragraphs=[
+                f"Hi {_first_name(expert)},",
+                f"{successor_name} is now your delivery lead. They'll assign "
+                "your work and approve your tasks from here.",
+                "Nothing you've already earned is affected.",
+            ],
+            cta=("Open your work", _link("/work")),
         )

@@ -90,9 +90,9 @@ class PlatformEarningsTests(TestCase):
 
         data = analytics.platform_earnings()
         self.assertEqual(data["delivered_value_usd"], "1000.00")
-        self.assertEqual(data["team_cost_usd"], "750.00")
-        self.assertEqual(data["earned_usd"], "250.00")
-        self.assertEqual(data["margin_percent"], "25.00")
+        self.assertEqual(data["team_cost_usd"], "850.00")
+        self.assertEqual(data["earned_usd"], "150.00")
+        self.assertEqual(data["margin_percent"], "15.00")
 
     def test_the_parts_always_close_on_the_whole(self):
         """The invariant. The platform's share is a remainder, never a
@@ -153,10 +153,10 @@ class PlatformEarningsTests(TestCase):
         cash = analytics.cash_position()
         # What the client actually paid, processing fee included — not the quote.
         self.assertEqual(cash["collected_usd"], "1015.00")
-        self.assertEqual(cash["credited_usd"], "750.00")
+        self.assertEqual(cash["credited_usd"], "850.00")
         self.assertEqual(cash["paid_out_usd"], "0.00")
         # Credited but not drawn: a liability the platform is holding.
-        self.assertEqual(cash["owed_to_team_usd"], "750.00")
+        self.assertEqual(cash["owed_to_team_usd"], "850.00")
 
     def test_a_requested_withdrawal_counts_against_what_is_owed(self):
         project = self.delivered(1000)
@@ -168,7 +168,7 @@ class PlatformEarningsTests(TestCase):
             status=Withdrawal.Status.REQUESTED)
         cash = analytics.cash_position()
         self.assertEqual(cash["pending_withdrawals_usd"], "100.00")
-        self.assertEqual(cash["owed_to_team_usd"], "650.00")
+        self.assertEqual(cash["owed_to_team_usd"], "750.00")
 
     def test_exposure_is_money_out_on_unfinished_work(self):
         live = Project.objects.create(
@@ -204,7 +204,7 @@ class PlatformEarningsTests(TestCase):
         self.delivered(1000)
         self.assertEqual(Earning.objects.count(), 0)
         data = analytics.dashboard()
-        self.assertEqual(data["platform"]["earned_usd"], "250.00")
+        self.assertEqual(data["platform"]["earned_usd"], "150.00")
 
     def test_the_endpoint_returns_every_section(self):
         self.delivered(1000)

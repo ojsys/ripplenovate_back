@@ -179,7 +179,7 @@ def cash_position():
     # Credited against work the client hasn't signed off yet. Real money out on
     # projects that could still be disputed — the platform's live exposure.
     exposure = _money(
-        Earning.objects.exclude(project__stage=Stage.COMPLETED)
+        Earning.objects.exclude(project__stage__in=Project.CLOSED_STAGES)
         .aggregate(t=Sum("amount_usd"))["t"] or 0
     )
 
@@ -262,7 +262,7 @@ def by_product_line():
 
 def pipeline():
     """What's in flight, by stage — the shape of what's coming."""
-    counts = (Project.objects.exclude(stage=Stage.COMPLETED)
+    counts = (Project.objects.exclude(stage__in=Project.CLOSED_STAGES)
               .values("stage")
               .annotate(n=Count("id"), value=Sum("quote_usd")))
     found = {row["stage"]: row for row in counts}

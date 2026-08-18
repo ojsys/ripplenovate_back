@@ -2,7 +2,7 @@ from django.contrib import admin
 from django.utils.html import format_html, format_html_join
 from django.utils.safestring import mark_safe
 
-from .models import Activity, Attachment, Project, Task
+from .models import Activity, Attachment, CycleRun, Engagement, Project, Task
 
 
 def _usd(amount):
@@ -254,3 +254,29 @@ class ActivityAdmin(admin.ModelAdmin):
     list_filter = ("kind", "role_label")
     search_fields = ("text", "author_name", "project__code")
     readonly_fields = ("created_at",)
+
+
+@admin.register(Engagement)
+class EngagementAdmin(admin.ModelAdmin):
+    list_display = ("title", "organisation", "monthly_amount_usd", "billing_day",
+                    "status", "started_on", "ends_on")
+    list_filter = ("status", "product_line")
+    search_fields = ("title", "organisation__name", "client__email")
+
+
+@admin.register(CycleRun)
+class CycleRunAdmin(admin.ModelAdmin):
+    """Read-only. "Did the billing job fire, and what did it do?" has to be
+    answerable here rather than from a server log nobody can reach."""
+
+    list_display = ("ran_at", "dry_run", "created_count", "skipped_count",
+                    "triggered_by")
+    list_filter = ("dry_run",)
+    readonly_fields = ("ran_at", "dry_run", "created_count", "skipped_count",
+                       "detail", "triggered_by")
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False

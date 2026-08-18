@@ -53,15 +53,15 @@ class CommissionSplitTests(CommissionTestCase):
         self.assertEqual(split["business_dev_usd"], Decimal("0.00"))
         self.assertEqual(split["business_dev_percent"], Decimal("0"))
         self.assertFalse(split["has_business_dev"])
-        self.assertEqual(split["platform_usd"], Decimal("2500.00"))  # keeps the 5%
+        self.assertEqual(split["platform_usd"], Decimal("1500.00"))  # keeps the 5%
         self.assert_closes(split)
 
     def test_a_sourced_project_pays_5_percent_out_of_the_platform_share(self):
         split = self.project(quote=10000, bizdev=self.bizdev).payout_split()
-        self.assertEqual(split["expert_usd"], Decimal("6000.00"))
+        self.assertEqual(split["expert_usd"], Decimal("7000.00"))
         self.assertEqual(split["delivery_lead_usd"], Decimal("1500.00"))
         self.assertEqual(split["business_dev_usd"], Decimal("500.00"))
-        self.assertEqual(split["platform_usd"], Decimal("2000.00"))
+        self.assertEqual(split["platform_usd"], Decimal("1000.00"))
         self.assertTrue(split["has_business_dev"])
         self.assert_closes(split)
 
@@ -71,7 +71,7 @@ class CommissionSplitTests(CommissionTestCase):
             business_dev_share_percent=Decimal("10"),
         ).payout_split()
         self.assertEqual(split["business_dev_usd"], Decimal("1000.00"))
-        self.assertEqual(split["platform_usd"], Decimal("1500.00"))
+        self.assertEqual(split["platform_usd"], Decimal("500.00"))
         self.assertTrue(split["uses_override"])
         self.assert_closes(split)
 

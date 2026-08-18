@@ -17,7 +17,7 @@ from django.db.models import Count, Q, Sum
 
 from payments.models import Earning
 
-from .models import Project
+from .models import Engagement, Project, ProjectFeedback
 
 User = get_user_model()
 Stage = Project.Stage
@@ -147,7 +147,7 @@ def product_lines(scope=None):
     in_flight = (
         Earning.objects
         .filter(project__in=projects)
-        .exclude(project__stage=Stage.COMPLETED)
+        .exclude(project__stage__in=Project.CLOSED_STAGES)
         .values("project__product_line__slug")
         .annotate(total=Sum("amount_usd"))
     )
@@ -270,7 +270,7 @@ def delivery_leads():
             projects=Count("id"),
             delivered=Count("id", filter=Q(stage=Stage.COMPLETED)),
             delivered_value=Sum("quote_usd", filter=Q(stage=Stage.COMPLETED)),
-            in_flight_value=Sum("quote_usd", filter=~Q(stage=Stage.COMPLETED)),
+            in_flight_value=Sum("quote_usd", filter=~Q(stage__in=Project.CLOSED_STAGES)),
         )
     )
     by_lead = {row["lead_id"]: row for row in led}
@@ -292,12 +292,26 @@ def delivery_leads():
         if project.is_on_time is not None:
             on_time[project.lead_id].append(project.is_on_time)
 
+    # What their clients actually thought. Kept to a mean and a sample size,
+    # the same discipline on-time rate already follows: a lead with one 5/5 and
+    # a lead with forty 4.6s must not read as the same thing, and a lead nobody
+    # has rated shows null rather than a flattering blank.
+    ratings = defaultdict(list)
+    repeat = defaultdict(list)
+    for entry in ProjectFeedback.objects.select_related("project"):
+        lead_id = entry.project.lead_id
+        if not lead_id:
+            continue
+        ratings[lead_id].append(entry.rating)
+        if entry.would_work_again is not None:
+            repeat[lead_id].append(entry.would_work_again)
+
     # Work that's already past its promised date and still running — the number a
     # lead can actually do something about today.
     overdue = defaultdict(int)
     for project in Project.objects.filter(
         lead__isnull=False, target_date__isnull=False
-    ).exclude(stage=Stage.COMPLETED):
+    ).exclude(stage__in=Project.CLOSED_STAGES):
         if project.is_overdue:
             overdue[project.lead_id] += 1
 
@@ -322,6 +336,9 @@ def delivery_leads():
             "on_time_percent": _rate(on_time.get(lead.id, [])),
             "on_time_sample": len(on_time.get(lead.id, [])),
             "overdue_count": overdue.get(lead.id, 0),
+            "avg_rating": _avg(ratings.get(lead.id, [])),
+            "rating_sample": len(ratings.get(lead.id, [])),
+            "would_repeat_percent": _rate(repeat.get(lead.id, [])),
         })
     return sorted(rows, key=lambda r: -r["delivered_value_usd"])
 
@@ -331,7 +348,7 @@ def totals(scope=None):
     projects = scope if scope is not None else Project.objects.all()
     ensure_credited(projects)
     delivered = projects.filter(stage=Stage.COMPLETED)
-    active = projects.exclude(stage=Stage.COMPLETED)
+    active = projects.exclude(stage__in=Project.CLOSED_STAGES)
 
     delivered_value = _money(delivered.aggregate(t=Sum("quote_usd"))["t"] or 0)
     # Costs against delivered work only. Task payouts land as a lead approves
@@ -374,4 +391,31 @@ def totals(scope=None):
         "on_time_percent": _rate(punctuality),
         "on_time_sample": len(punctuality),
         "overdue_count": overdue,
+        # Recurring versus one-off. The single most useful split in a services
+        # business — retainer revenue is predictable and far cheaper to keep
+        # than to win, and until now the platform couldn't tell them apart.
+        **_recurring_mix(delivered, active),
+    }
+
+
+def _recurring_mix(delivered, active):
+    """How much of the book is retainer work rather than one-off briefs."""
+    recurring_delivered = _money(
+        delivered.filter(engagement__isnull=False)
+        .aggregate(t=Sum("quote_usd"))["t"] or 0)
+    total_delivered = _money(
+        delivered.aggregate(t=Sum("quote_usd"))["t"] or 0)
+    return {
+        "recurring_delivered_usd": str(recurring_delivered),
+        "one_off_delivered_usd": str(_money(total_delivered - recurring_delivered)),
+        "recurring_percent": (
+            str(_money(recurring_delivered / total_delivered * 100))
+            if total_delivered else None
+        ),
+        # What's contracted to recur, whether or not it has been delivered yet.
+        "active_engagements": Engagement.objects.filter(
+            status=Engagement.Status.ACTIVE).count(),
+        "monthly_recurring_usd": str(_money(
+            Engagement.objects.filter(status=Engagement.Status.ACTIVE)
+            .aggregate(t=Sum("monthly_amount_usd"))["t"] or 0)),
     }

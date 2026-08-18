@@ -1,6 +1,8 @@
 import uuid
+from decimal import Decimal
 from pathlib import Path
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db.models import Q
@@ -18,6 +20,8 @@ from catalog.models import ProductLine
 from .emails import (
     notify_admins_of_application,
     notify_admins_of_kyc,
+    notify_added_to_organisation,
+    notify_lead_offboarded,
     notify_roster_changed,
     notify_lead_invitation_accepted,
     send_application_received,
@@ -36,6 +40,10 @@ from . import impersonation
 from .models import (
     EmailToken,
     ImpersonationEvent,
+    Notification,
+    Organisation,
+    OrganisationMember,
+    TermsAcceptance,
     Invitation,
     KycProfile,
     ProfessionalProfile,
@@ -109,6 +117,11 @@ def me_payload(request):
         {"id": admin.id, "email": admin.email, "full_name": admin.full_name}
         if admin else None
     )
+    # Folded in here rather than given its own poll: /auth/me already runs on
+    # every page load, and a second request per page to render a badge is a
+    # cost the badge doesn't justify.
+    data["unread_notifications"] = Notification.objects.filter(
+        user=request.user, read_at__isnull=True).count()
     return data
 
 
@@ -126,6 +139,10 @@ def register(request):
     serializer = RegisterSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
     user = serializer.save()
+    if user.role == User.Role.CLIENT:
+        # Every client buys through an organisation, including the sole trader
+        # who has never heard the word — one code path downstream.
+        Organisation.ensure_for(user)
     send_verification_email(user)
     return Response(
         {"user": UserSerializer(user).data,
@@ -271,13 +288,21 @@ def user_directory(request):
     is to find one specific person whose account you need to stand in, and you
     usually only know a fragment of their email.
     """
-    _require_admin(request.user)
-    qs = User.objects.all()
+    # Admins see everyone — that's the impersonation directory. A delivery
+    # lead is narrowed to clients and nothing else: they need one to set up a
+    # retainer for, and that is not a reason to hand them the whole user list
+    # including other leads' experts.
+    is_admin = request.user.is_superuser
+    if not is_admin:
+        if request.user.role != User.Role.DELIVERY_LEAD or not request.user.is_approved:
+            raise PermissionDenied("Only an administrator can do that.")
+    qs = User.objects.all() if is_admin else User.objects.filter(
+        role=User.Role.CLIENT)
     term = (request.query_params.get("q") or "").strip()
     if term:
         qs = qs.filter(Q(email__icontains=term) | Q(full_name__icontains=term))
     role = request.query_params.get("role")
-    if role:
+    if role and is_admin:
         qs = qs.filter(role=role)
     qs = qs.prefetch_related("product_lines").order_by("full_name", "email")[:50]
     return Response(
@@ -1107,3 +1132,327 @@ def download_document(request, kind, user_id):
     # These are personal documents: never let a proxy or the browser keep a copy.
     response["Cache-Control"] = "no-store, private"
     return response
+
+
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def notifications(request):
+    """The signed-in user's bell.
+
+    GET returns the most recent 50 — a bell is for what just happened, and
+    anything older is answered by the project page itself. POST marks them
+    read: everything, or the ids given.
+    """
+    if request.method == "POST":
+        ids = request.data.get("ids")
+        qs = Notification.objects.filter(user=request.user, read_at__isnull=True)
+        if ids:
+            qs = qs.filter(id__in=ids)
+        qs.update(read_at=timezone.now())
+        return Response({"unread": Notification.objects.filter(
+            user=request.user, read_at__isnull=True).count()})
+
+    rows = Notification.objects.filter(user=request.user)[:50]
+    return Response({
+        "unread": sum(1 for n in rows if n.read_at is None),
+        "notifications": [
+            {
+                "id": n.id,
+                "title": n.title,
+                "body": n.body,
+                "url": n.url,
+                "read": n.read_at is not None,
+                "created_at": n.created_at,
+            }
+            for n in rows
+        ],
+    })
+
+
+# ---------------------------------------------------------------------------
+# Client organisations
+# ---------------------------------------------------------------------------
+
+def _org_seat(user, organisation_id=None):
+    """The caller's seat, defaulting to their only one.
+
+    Most clients belong to exactly one organisation and should never have to
+    say which. Passing an id matters only for the rare person who sits at two.
+    """
+    seats = list(user.organisation_memberships.select_related("organisation"))
+    if not seats:
+        return None
+    if organisation_id:
+        return next(
+            (s for s in seats if s.organisation_id == int(organisation_id)), None
+        )
+    return seats[0]
+
+
+def _org_payload(seat):
+    org = seat.organisation
+    return {
+        "id": org.id,
+        "name": org.name,
+        "slug": org.slug,
+        "billing_email": org.billing_email,
+        "preferred_currency": org.preferred_currency,
+        "my_role": seat.role,
+        "can_manage": seat.role == OrganisationMember.Role.OWNER,
+        "members": [
+            {
+                "id": m.user_id,
+                "name": m.user.full_name or m.user.email,
+                "email": m.user.email,
+                "role": m.role,
+                "role_label": m.get_role_display(),
+                "initials": m.user.initials,
+            }
+            for m in org.memberships.select_related("user")
+        ],
+    }
+
+
+@api_view(["GET", "PATCH"])
+@permission_classes([IsAuthenticated])
+def my_organisation(request):
+    """The company the signed-in client buys through.
+
+    PATCH is the owner's: renaming it, and setting where invoices go when
+    that isn't the person who posted the brief.
+    """
+    seat = _org_seat(request.user, request.query_params.get("organisation"))
+    if not seat:
+        return Response({"detail": "You don't belong to an organisation."},
+                        status=status.HTTP_404_NOT_FOUND)
+    if request.method == "PATCH":
+        if seat.role != OrganisationMember.Role.OWNER:
+            raise PermissionDenied("Only an owner can change the company details.")
+        org = seat.organisation
+        name = (request.data.get("name") or "").strip()
+        if name:
+            org.name = name[:150]
+        if "billing_email" in request.data:
+            org.billing_email = (request.data.get("billing_email") or "").strip()
+        if "preferred_currency" in request.data:
+            # Which rail can carry their charges follows from this, so an
+            # unrecognised code would leave them unable to pay at all. Blank
+            # is always valid and means "the platform default".
+            from payments import gateways, stripe_gateway
+
+            code = (request.data.get("preferred_currency") or "").strip().upper()
+            allowed = gateways.PAYSTACK_CURRENCIES | stripe_gateway.CURRENCIES
+            if code and code not in allowed:
+                return Response(
+                    {"detail": f"We can't currently charge in {code}."},
+                    status=status.HTTP_400_BAD_REQUEST)
+            org.preferred_currency = code
+        org.save(update_fields=["name", "billing_email", "preferred_currency"])
+    return Response(_org_payload(seat))
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def organisation_members(request):
+    """Add a colleague to the company, by email.
+
+    Deliberately only connects accounts that already exist. Creating one from
+    an email address here would mean a stranger's address could be turned into
+    a login by anyone who guessed it, and the invitation machinery that does
+    this properly already exists for experts — this is not the place to build a
+    second, weaker one.
+    """
+    seat = _org_seat(request.user, request.data.get("organisation"))
+    if not seat:
+        return Response({"detail": "You don't belong to an organisation."},
+                        status=status.HTTP_404_NOT_FOUND)
+    if seat.role != OrganisationMember.Role.OWNER:
+        raise PermissionDenied("Only an owner can add people to the company.")
+
+    email = (request.data.get("email") or "").strip().lower()
+    role = request.data.get("role") or OrganisationMember.Role.MEMBER
+    if role not in OrganisationMember.Role.values:
+        return Response({"detail": "Pick a valid role."},
+                        status=status.HTTP_400_BAD_REQUEST)
+    person = User.objects.filter(email__iexact=email).first()
+    if not person:
+        return Response(
+            {"detail": "No account with that email yet. Ask them to sign up "
+                       "first, then add them here."},
+            status=status.HTTP_400_BAD_REQUEST)
+    if person.role != User.Role.CLIENT:
+        return Response(
+            {"detail": f"{person.full_name or email} works on the delivery side, "
+                       "so they can't be added as a buyer."},
+            status=status.HTTP_400_BAD_REQUEST)
+
+    membership, created = OrganisationMember.objects.get_or_create(
+        organisation=seat.organisation, user=person,
+        defaults={"role": role, "invited_by": request.user},
+    )
+    if not created:
+        return Response({"detail": "They're already on this company."},
+                        status=status.HTTP_400_BAD_REQUEST)
+    notify_added_to_organisation(membership)
+    return Response(_org_payload(_org_seat(request.user, seat.organisation_id)),
+                    status=status.HTTP_201_CREATED)
+
+
+@api_view(["PATCH", "DELETE"])
+@permission_classes([IsAuthenticated])
+def organisation_member(request, user_id):
+    """Change a colleague's seat, or remove them."""
+    seat = _org_seat(request.user, request.data.get("organisation"))
+    if not seat or seat.role != OrganisationMember.Role.OWNER:
+        raise PermissionDenied("Only an owner can manage the company's people.")
+    target = OrganisationMember.objects.filter(
+        organisation=seat.organisation, user_id=user_id).first()
+    if not target:
+        return Response({"detail": "They aren't on this company."},
+                        status=status.HTTP_404_NOT_FOUND)
+
+    owners = [m for m in seat.organisation.memberships.all()
+              if m.role == OrganisationMember.Role.OWNER]
+    losing_last_owner = (
+        target.role == OrganisationMember.Role.OWNER and len(owners) == 1
+    )
+    if request.method == "DELETE":
+        if losing_last_owner:
+            # Otherwise the company is left with projects nobody can administer.
+            return Response(
+                {"detail": "Make somebody else an owner first — a company can't "
+                           "be left without one."},
+                status=status.HTTP_400_BAD_REQUEST)
+        removing_self = target.user_id == request.user.id
+        target.delete()
+        if removing_self:
+            # They've just given up the seat this response would be built from.
+            # Say so plainly rather than 500-ing on a membership that no
+            # longer exists.
+            return Response({"detail": "You've left this company."})
+    else:
+        role = request.data.get("role")
+        if role not in OrganisationMember.Role.values:
+            return Response({"detail": "Pick a valid role."},
+                            status=status.HTTP_400_BAD_REQUEST)
+        if losing_last_owner and role != OrganisationMember.Role.OWNER:
+            return Response(
+                {"detail": "Make somebody else an owner first — a company can't "
+                           "be left without one."},
+                status=status.HTTP_400_BAD_REQUEST)
+        target.role = role
+        target.save(update_fields=["role"])
+    return Response(_org_payload(_org_seat(request.user, seat.organisation_id)))
+
+
+# ---------------------------------------------------------------------------
+# Terms, and letting a delivery lead go
+# ---------------------------------------------------------------------------
+
+def _terms_state(user):
+    version = settings.TERMS_VERSION
+    return {
+        "version": version,
+        "accepted": TermsAcceptance.objects.filter(
+            user=user, version=version).exists(),
+        # Only the delivery side is gated. A client agreeing to terms is a
+        # signup checkbox; a partner agreeing to non-circumvention terms is the
+        # thing that has to be recorded and re-asked when they change.
+        "required": user.role in (User.Role.DELIVERY_LEAD, User.Role.EXPERT,
+                                  User.Role.BUSINESS_DEV),
+    }
+
+
+@api_view(["GET", "POST"])
+@permission_classes([IsAuthenticated])
+def terms(request):
+    """Read whether the signed-in user is on the current terms, or accept them."""
+    if request.method == "POST":
+        TermsAcceptance.objects.get_or_create(
+            user=request.user, version=settings.TERMS_VERSION,
+            defaults={"ip_address": _client_ip(request)},
+        )
+    return Response(_terms_state(request.user))
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def offboard_lead(request, user_id):
+    """Hand a departing delivery lead's book to somebody else.
+
+    Until now a lead leaving left orphans: experts with a dangling `lead`, live
+    projects with an owner who no longer works here, and retainers that would
+    keep billing into nobody's inbox. The roster and the client relationships
+    are also exactly where the disintermediation risk actually sits — not with
+    the experts, who never met the client.
+
+    Deliberately **does not touch completed earnings.** Money already credited
+    belongs to the person who earned it, and reassigning a project must never
+    restate who was paid for it.
+    """
+    _require_admin(request.user)
+    leaving = User.objects.filter(
+        id=user_id, role=User.Role.DELIVERY_LEAD).first()
+    if not leaving:
+        return Response({"detail": "No delivery lead with that id."},
+                        status=status.HTTP_404_NOT_FOUND)
+
+    successor_id = request.data.get("successor")
+    successor = User.objects.filter(
+        id=successor_id, role=User.Role.DELIVERY_LEAD).first() if successor_id else None
+    if not successor:
+        return Response(
+            {"detail": "Name another delivery lead to take this on."},
+            status=status.HTTP_400_BAD_REQUEST)
+    if successor.id == leaving.id:
+        return Response({"detail": "Pick somebody else."},
+                        status=status.HTTP_400_BAD_REQUEST)
+    if not successor.is_approved:
+        return Response(
+            {"detail": "That lead's account is still being reviewed."},
+            status=status.HTTP_400_BAD_REQUEST)
+
+    from projects.models import Engagement, Project
+
+    # The roster. Widened into the successor's lines so nobody becomes
+    # unassignable, the same rule a voluntary roster move already follows.
+    roster = list(leaving.team_members.filter(role=User.Role.EXPERT))
+    for expert in roster:
+        expert.lead = successor
+        expert.save(update_fields=["lead"])
+        expert.product_lines.add(*successor.product_lines.all())
+
+    # Live work only. A completed project keeps the lead who delivered it —
+    # rewriting that would misattribute history and disagree with the ledger.
+    live = Project.objects.filter(lead=leaving).exclude(
+        stage__in=Project.CLOSED_STAGES)
+    moved_projects = live.count()
+    live.update(lead=successor)
+
+    retainers = Engagement.objects.filter(lead=leaving).exclude(
+        status=Engagement.Status.ENDED)
+    moved_retainers = retainers.count()
+    retainers.update(lead=successor)
+
+    outstanding = _unsettled_balance(leaving)
+    notify_lead_offboarded(leaving, successor, moved_projects, len(roster))
+
+    return Response({
+        "detail": f"{leaving.full_name or leaving.email}'s book moved to "
+                  f"{successor.full_name or successor.email}.",
+        "experts_moved": len(roster),
+        "projects_moved": moved_projects,
+        "retainers_moved": moved_retainers,
+        # Reported rather than settled: paying somebody out is a decision with
+        # a two-person rule on it, and it doesn't belong inside a bulk move.
+        "outstanding_balance_usd": str(outstanding),
+    })
+
+
+def _unsettled_balance(user):
+    from payments import earnings as earnings_service
+
+    try:
+        return earnings_service.available_balance(user)
+    except Exception:  # noqa: BLE001 — reporting a balance must not block the move
+        return Decimal("0.00")

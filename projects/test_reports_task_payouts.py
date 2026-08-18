@@ -67,10 +67,10 @@ class ReportingWithTaskPayoutsTests(TestCase):
 
         totals = reports.totals()
         self.assertEqual(totals["delivered_value_usd"], "1000.00")
-        # 60% expert + 15% lead on the delivered project only.
-        self.assertEqual(totals["paid_out_usd"], "750.00")
-        self.assertEqual(totals["platform_usd"], "250.00")
-        self.assertEqual(totals["margin_percent"], "25.00")
+        # 70% expert + 15% lead on the delivered project only.
+        self.assertEqual(totals["paid_out_usd"], "850.00")
+        self.assertEqual(totals["platform_usd"], "150.00")
+        self.assertEqual(totals["margin_percent"], "15.00")
 
     def test_in_flight_cash_is_reported_rather_than_hidden(self):
         live = self.project(5000, Project.Stage.IN_PROGRESS)
@@ -123,7 +123,7 @@ class ReportingWithTaskPayoutsTests(TestCase):
         Earning.objects.filter(project=done, kind=Earning.Kind.DELIVERY_LEAD).delete()
         # ensure_credited only fills gaps for projects with *no* earnings at
         # all, so the remaining expert row is what the report now sees.
-        self.assertEqual(reports.totals()["paid_out_usd"], "600.00")
+        self.assertEqual(reports.totals()["paid_out_usd"], "700.00")
 
     def test_the_reports_endpoint_carries_the_new_figure(self):
         live = self.project(5000, Project.Stage.IN_PROGRESS)

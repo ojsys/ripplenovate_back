@@ -43,12 +43,12 @@ class PayoutSplitTests(TestCase):
         total = split["expert_usd"] + split["delivery_lead_usd"] + split["platform_usd"]
         self.assertEqual(total, split["quote_usd"])
 
-    def test_site_defaults_split_60_15_25(self):
+    def test_site_defaults_split_70_15_15(self):
         split = self.project(quote=1000).payout_split()
-        self.assertEqual(split["expert_usd"], Decimal("600.00"))
+        self.assertEqual(split["expert_usd"], Decimal("700.00"))
         self.assertEqual(split["delivery_lead_usd"], Decimal("150.00"))
-        self.assertEqual(split["platform_usd"], Decimal("250.00"))
-        self.assertEqual(split["platform_percent"], Decimal("25.00"))
+        self.assertEqual(split["platform_usd"], Decimal("150.00"))
+        self.assertEqual(split["platform_percent"], Decimal("15.00"))
         self.assert_closes(split)
 
     def test_per_project_override_moves_the_platform_remainder(self):
@@ -180,7 +180,7 @@ class EarningsCreditTests(TestCase):
         kinds = set(Earning.objects.filter(user=self.lead).values_list("kind", flat=True))
         self.assertEqual(kinds, {Earning.Kind.EXPERT, Earning.Kind.DELIVERY_LEAD})
         total = sum(e.amount_usd for e in Earning.objects.filter(user=self.lead))
-        self.assertEqual(total, Decimal("1500.00"))  # 60% + 15% of 2000
+        self.assertEqual(total, Decimal("1700.00"))  # 70% + 15% of 2000
 
 
 class AttachmentTests(TestCase):
@@ -364,24 +364,24 @@ class ReportingTests(TestCase):
         return client.get("/api/reports")
 
     def test_the_platform_share_is_delivered_value_minus_the_ledger(self):
-        self.completed(self.software, 10000)          # direct: platform keeps 25%
-        self.completed(self.design, 10000, self.bizdev)  # sourced: platform keeps 20%
+        self.completed(self.software, 10000)          # direct: platform keeps 15%
+        self.completed(self.design, 10000, self.bizdev)  # sourced: platform keeps 10%
 
         totals = self.report(self.admin).data["totals"]
         self.assertEqual(totals["delivered_value_usd"], "20000.00")
-        # 7500 + 8000 credited out across the two projects.
-        self.assertEqual(totals["paid_out_usd"], "15500.00")
-        self.assertEqual(totals["platform_usd"], "4500.00")
-        self.assertEqual(totals["margin_percent"], "22.50")
+        # 8500 + 9000 credited out across the two projects.
+        self.assertEqual(totals["paid_out_usd"], "17500.00")
+        self.assertEqual(totals["platform_usd"], "2500.00")
+        self.assertEqual(totals["margin_percent"], "12.50")
 
     def test_a_lines_margin_reflects_whether_work_was_sourced(self):
         self.completed(self.software, 10000)
         self.completed(self.design, 10000, self.bizdev)
 
         rows = {r["slug"]: r for r in self.report(self.admin).data["product_lines"]}
-        self.assertEqual(rows["software-web"]["margin_percent"], "25.00")
+        self.assertEqual(rows["software-web"]["margin_percent"], "15.00")
         self.assertEqual(rows["software-web"]["bizdev_cost_usd"], "0.00")
-        self.assertEqual(rows["design-creative"]["margin_percent"], "20.00")
+        self.assertEqual(rows["design-creative"]["margin_percent"], "10.00")
         self.assertEqual(rows["design-creative"]["bizdev_cost_usd"], "500.00")
 
     def test_reporting_ignores_a_later_change_to_the_percentages(self):
@@ -393,7 +393,7 @@ class ReportingTests(TestCase):
         row.save()
 
         totals = self.report(self.admin).data["totals"]
-        self.assertEqual(totals["platform_usd"], "2500.00")  # not 500
+        self.assertEqual(totals["platform_usd"], "1500.00")  # not 500
 
     def test_cycle_time_reports_its_sample_size(self):
         self.completed(self.software, 1000, days=10)
@@ -646,8 +646,8 @@ class OnTimeTests(TestCase):
 
         totals = self.report(self.admin)["totals"]
         # Not 100%: reporting credits what approval missed.
-        self.assertEqual(totals["margin_percent"], "25.00")
-        self.assertEqual(totals["paid_out_usd"], "7500.00")
+        self.assertEqual(totals["margin_percent"], "15.00")
+        self.assertEqual(totals["paid_out_usd"], "8500.00")
         self.assertEqual(project.earnings.count(), 2)
 
     def test_days_overdue_counts_only_live_work(self):

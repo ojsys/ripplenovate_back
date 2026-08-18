@@ -2,7 +2,7 @@ from django.contrib import admin, messages
 
 from . import earnings as earnings_service
 from . import notifications, transfers
-from .models import Earning, Payment, Withdrawal
+from .models import Earning, Payment, Refund, ReserveEntry, Withdrawal
 from .paystack import PaystackError
 
 
@@ -96,3 +96,32 @@ class WithdrawalAdmin(admin.ModelAdmin):
             self.message_user(request, f"{checked} payout(s) re-checked with Paystack.")
         for problem in problems:
             self.message_user(request, problem, level=messages.WARNING)
+
+
+@admin.register(Refund)
+class RefundAdmin(admin.ModelAdmin):
+    list_display = ("project", "amount_usd", "status", "requested_by",
+                    "funded_from_reserve_usd", "absorbed_usd", "created_at")
+    list_filter = ("status", "settled_manually")
+    search_fields = ("project__code", "project__title", "reason")
+    readonly_fields = ("funded_from_held_usd", "funded_from_reserve_usd",
+                       "absorbed_usd", "gateway", "gateway_reference",
+                       "gateway_raw", "processed_at", "created_at")
+
+
+@admin.register(ReserveEntry)
+class ReserveEntryAdmin(admin.ModelAdmin):
+    """Read-only. The reserve is a ledger; a ledger you can edit isn't one."""
+
+    list_display = ("created_at", "kind", "amount_usd", "project", "note")
+    list_filter = ("kind",)
+    search_fields = ("project__code", "note")
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False

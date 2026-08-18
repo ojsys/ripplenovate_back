@@ -23,8 +23,46 @@ def brand_name():
         return "Ripple Innovation Labs"
 
 
-def send_brand_email(subject, to, heading, paragraphs, cta=None, fail_silently=True):
-    """`to` may be a single address or an iterable. `cta` is an optional (label, url)."""
+def _store_in_app(subject, recipients, paragraphs, cta):
+    """Mirror an outgoing email into each recipient's notification bell.
+
+    Done here rather than at the ~25 call sites on purpose: the two channels
+    then share one recipient list by construction, so it is not possible to
+    add a notification that emails somebody without also reaching their bell.
+    A test asserts the parity; this is what makes it true.
+
+    Silently skips addresses with no account — an invitation goes to somebody
+    who doesn't exist here yet, and there is nowhere to put a bell for them.
+    """
+    try:
+        from accounts.models import Notification, User
+
+        body = next((p for p in paragraphs if p), "")
+        url = ""
+        if cta:
+            _, link = cta
+            # Store the path, not the absolute URL: the bell links within the
+            # app, and FRONTEND_URL differs between environments.
+            url = link.replace(settings.FRONTEND_URL.rstrip("/"), "", 1) or "/"
+        rows = [
+            Notification(user=user, title=subject, body=body, url=url)
+            for user in User.objects.filter(email__in=recipients, is_active=True)
+        ]
+        if rows:
+            Notification.objects.bulk_create(rows)
+    except Exception as exc:  # never let the bell break the email
+        logger.error("In-app notification failed (%s): %s", subject, exc)
+
+
+def send_brand_email(subject, to, heading, paragraphs, cta=None,
+                     fail_silently=True, notify=True):
+    """`to` may be a single address or an iterable. `cta` is an optional (label, url).
+
+    `notify=False` for mail that has no in-app counterpart — verifying an
+    address, resetting a password, inviting somebody who has no account yet.
+    A bell entry saying "confirm your email" is meaningless to someone already
+    signed in, and there is nobody to show one to before they are.
+    """
     recipients = [to] if isinstance(to, str) else list(to or [])
     recipients = sorted({e for e in recipients if e})
     if not recipients:
@@ -46,6 +84,9 @@ def send_brand_email(subject, to, heading, paragraphs, cta=None, fail_silently=T
         "paragraphs": escaped_paragraphs,
         "cta": escaped_cta,
     }
+
+    if notify:
+        _store_in_app(subject, recipients, paragraphs, cta)
 
     text_content = render_to_string("emails/brand_email.txt", context)
     html_content = render_to_string("emails/brand_email.html", context)

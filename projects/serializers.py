@@ -3,7 +3,16 @@ from rest_framework import serializers
 from catalog.models import ProductLine, Service
 from catalog.serializers import ProductLineBriefSerializer
 
-from .models import Activity, Attachment, Project, Task
+from .models import (
+    Activity,
+    Attachment,
+    ChangeOrder,
+    Engagement,
+    Project,
+    ProjectFeedback,
+    RevisionRequest,
+    Task,
+)
 
 
 def _initials(name):
@@ -112,14 +121,103 @@ class AttachmentCreateSerializer(serializers.Serializer):
     )
 
 
-class ActivitySerializer(serializers.ModelSerializer):
+class RevisionRequestSerializer(serializers.ModelSerializer):
+    requested_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = RevisionRequest
+        fields = ["id", "note", "created_at", "resolved_at", "requested_by_name"]
+        read_only_fields = fields
+
+    def get_requested_by_name(self, obj):
+        if not obj.requested_by:
+            return ""
+        return obj.requested_by.full_name or obj.requested_by.email
+
+
+class ChangeOrderSerializer(serializers.ModelSerializer):
+    raised_by_name = serializers.SerializerMethodField()
+    status_label = serializers.CharField(source="get_status_display", read_only=True)
+    is_payable = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = ChangeOrder
+        fields = ["id", "description", "amount_usd", "status", "status_label",
+                  "is_payable", "raised_by_name", "created_at", "paid_at"]
+        read_only_fields = fields
+
+    def get_raised_by_name(self, obj):
+        if not obj.raised_by:
+            return ""
+        return obj.raised_by.full_name or obj.raised_by.email
+
+
+class ChangeOrderCreateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ChangeOrder
+        fields = ["description", "amount_usd"]
+
+    def validate_description(self, value):
+        value = value.strip()
+        if not value:
+            raise serializers.ValidationError(
+                "Describe the extra work — the client sees this on the invoice."
+            )
+        return value
+
+    def validate_amount_usd(self, value):
+        if value <= 0:
+            raise serializers.ValidationError("A change order has to be worth something.")
+        return value
+
+
+class ProjectFeedbackSerializer(serializers.ModelSerializer):
+    """The client writing their verdict, and the lead reading it.
+
+    Same serializer both ways — there is nothing in here the client shouldn't
+    see, because they wrote it. Who may *read* it is enforced on the project
+    serializer, not by narrowing fields here.
+    """
+
+    class Meta:
+        model = ProjectFeedback
+        fields = ["rating", "comment", "would_work_again", "created_at"]
+        read_only_fields = ["created_at"]
+
+    def validate_rating(self, value):
+        if not 1 <= value <= 5:
+            raise serializers.ValidationError("Rate it from 1 to 5.")
+        return value
+
+
+class ActivityReplySerializer(serializers.ModelSerializer):
+    """A reply. Flat by construction — a reply never has replies of its own."""
+
     initials = serializers.SerializerMethodField()
     attachments = AttachmentSerializer(many=True, read_only=True)
 
     class Meta:
         model = Activity
-        fields = ["id", "author_name", "role_label", "kind", "text", "created_at",
+        fields = ["id", "author_name", "role_label", "text", "created_at",
                   "initials", "attachments"]
+        read_only_fields = fields
+
+    def get_initials(self, obj):
+        return _initials(obj.author_name)
+
+
+class ActivitySerializer(serializers.ModelSerializer):
+    initials = serializers.SerializerMethodField()
+    attachments = AttachmentSerializer(many=True, read_only=True)
+    replies = ActivityReplySerializer(many=True, read_only=True)
+    # The deliverable this comment is about, if any. Just the id — the file's
+    # own details are already in the attachments list the page renders.
+    attachment = serializers.PrimaryKeyRelatedField(read_only=True)
+
+    class Meta:
+        model = Activity
+        fields = ["id", "author_name", "role_label", "kind", "text", "created_at",
+                  "initials", "attachments", "replies", "attachment"]
 
     def get_initials(self, obj):
         return _initials(obj.author_name)
@@ -144,6 +242,7 @@ class ProjectListSerializer(serializers.ModelSerializer):
             "quote_usd", "expert", "expert_name", "progress_pct", "is_paid",
             "target_date", "created_at", "product_line", "service_name",
             "is_overdue", "days_overdue", "is_on_time", "days_late",
+            "revision_rounds",
         ]
         # Output only. Lifecycle fields are moved by the viewset's actions (which
         # log activity and notify), never written straight from a request body.
@@ -151,6 +250,7 @@ class ProjectListSerializer(serializers.ModelSerializer):
             "code", "title", "company", "category", "stage", "quote_usd",
             "expert", "target_date", "created_at", "product_line", "service_name",
             "is_overdue", "days_overdue", "is_on_time", "days_late",
+            "revision_rounds",
         ]
 
     def get_service_name(self, obj):
@@ -182,9 +282,13 @@ class ProjectDetailSerializer(ProjectListSerializer):
     expert_role = serializers.SerializerMethodField()
     business_developer_name = serializers.SerializerMethodField()
     team = serializers.SerializerMethodField()
-    tasks = TaskSerializer(many=True, read_only=True)
-    activity = ActivitySerializer(many=True, read_only=True)
-    attachments = AttachmentSerializer(many=True, read_only=True)
+    # All three go through methods so a billing-only seat can be handed the
+    # money and not the work. Activity is roots-only besides: replies are
+    # carried nested inside their parent, so listing everything flat here
+    # would render each one twice.
+    tasks = serializers.SerializerMethodField()
+    activity = serializers.SerializerMethodField()
+    attachments = serializers.SerializerMethodField()
     # What the lead has to hand out, and what's left. The allocation meter is
     # where they find out they've committed more than the project holds — it
     # should say so before a save fails.
@@ -195,6 +299,38 @@ class ProjectDetailSerializer(ProjectListSerializer):
     unallocated_usd = serializers.DecimalField(
         max_digits=12, decimal_places=2, read_only=True)
     uses_task_payouts = serializers.BooleanField(read_only=True)
+    # The change request the team still owes an answer to. Carried in full
+    # rather than as a flag: the client needs to see what they asked for while
+    # they wait, and the team needs it in front of them while they fix it.
+    open_revision = serializers.SerializerMethodField()
+    revision_history = serializers.SerializerMethodField()
+    # Why a lead can't close this over the client's head yet, or null when they
+    # can. Sent so the board can explain the rule in place rather than letting
+    # someone discover it by getting a 403.
+    completion_block = serializers.SerializerMethodField()
+    # The refund position, so a lead cancelling a paid project can see what's
+    # actually returnable rather than guessing from the quote.
+    collected_usd = serializers.DecimalField(
+        max_digits=12, decimal_places=2, read_only=True)
+    refunded_usd = serializers.DecimalField(
+        max_digits=12, decimal_places=2, read_only=True)
+    refundable_usd = serializers.DecimalField(
+        max_digits=12, decimal_places=2, read_only=True)
+    free_refund_usd = serializers.DecimalField(
+        max_digits=12, decimal_places=2, read_only=True)
+    # Extra scope, and what the project is now worth in total. Kept apart from
+    # `quote_usd` so the invoice the client settled stays legible next to it.
+    change_orders = ChangeOrderSerializer(many=True, read_only=True)
+    change_orders_usd = serializers.DecimalField(
+        max_digits=12, decimal_places=2, read_only=True)
+    contract_usd = serializers.DecimalField(
+        max_digits=12, decimal_places=2, read_only=True)
+    # The client's private verdict. Visible to whoever wrote it, the lead
+    # running the project, and admins — never to the experts who delivered it,
+    # and never to another lead. Withheld here rather than filtered in the view
+    # so there's one place the rule lives.
+    feedback = serializers.SerializerMethodField()
+    can_leave_feedback = serializers.SerializerMethodField()
 
     class Meta(ProjectListSerializer.Meta):
         fields = ProjectListSerializer.Meta.fields + [
@@ -202,8 +338,78 @@ class ProjectDetailSerializer(ProjectListSerializer):
             "expert_role", "team", "tasks", "activity", "attachments",
             "business_developer", "business_developer_name",
             "expert_pool_usd", "allocated_usd", "unallocated_usd",
-            "uses_task_payouts",
+            "uses_task_payouts", "open_revision", "revision_history",
+            "completion_block", "cancelled_at", "cancellation_reason",
+            "collected_usd", "refunded_usd", "refundable_usd", "free_refund_usd",
+            "change_orders", "change_orders_usd", "contract_usd",
+            "feedback", "can_leave_feedback",
         ]
+
+    def _viewer(self):
+        request = self.context.get("request")
+        return getattr(request, "user", None)
+
+    def get_feedback(self, obj):
+        entry = getattr(obj, "feedback", None)
+        if entry is None:
+            return None
+        viewer = self._viewer()
+        if viewer is None:
+            return None
+        may_read = (
+            viewer.id == obj.client_id
+            or viewer.id == obj.lead_id
+            or viewer.is_superuser
+        )
+        return ProjectFeedbackSerializer(entry).data if may_read else None
+
+    def get_can_leave_feedback(self, obj):
+        """Whether the person reading this is the client, and still owes one."""
+        viewer = self._viewer()
+        if viewer is None or viewer.id != obj.client_id:
+            return False
+        return (obj.stage in Project.CLOSED_STAGES
+                and getattr(obj, "feedback", None) is None)
+
+    def _sees_delivery(self, obj):
+        """Whether the reader is entitled to the work, or only to the invoice.
+
+        Redacted in the serializer rather than the view so there is one place
+        the rule lives — a billing-only seat that could reach the deliverables
+        through some other endpoint would make the distinction decorative.
+        """
+        from .access import can_see_delivery
+
+        viewer = self._viewer()
+        return viewer is None or can_see_delivery(viewer, obj)
+
+    def get_activity(self, obj):
+        if not self._sees_delivery(obj):
+            return []
+        roots = [a for a in obj.activity.all() if a.parent_id is None]
+        return ActivitySerializer(roots, many=True).data
+
+    def get_attachments(self, obj):
+        if not self._sees_delivery(obj):
+            return []
+        return AttachmentSerializer(obj.attachments.all(), many=True).data
+
+    def get_tasks(self, obj):
+        if not self._sees_delivery(obj):
+            return []
+        return TaskSerializer(obj.tasks.all(), many=True).data
+
+    def get_completion_block(self, obj):
+        if obj.stage != Project.Stage.REVIEW:
+            return None
+        return obj.client_silence_block()
+
+    def get_open_revision(self, obj):
+        return RevisionRequestSerializer(obj.open_revision).data if obj.open_revision else None
+
+    def get_revision_history(self, obj):
+        return RevisionRequestSerializer(
+            obj.revision_requests.all(), many=True).data
 
     def get_team(self, obj):
         # Ordered so the primary expert reads first, then by name.
@@ -356,3 +562,94 @@ class ActivityCreateSerializer(serializers.Serializer):
     )
     # Links shared with the update — how design and research work is handed over.
     attachments = AttachmentCreateSerializer(many=True, required=False, default=list)
+    # What this replies to, and what it's about. Both optional and both
+    # validated against the project in the view rather than here — the
+    # serializer has no idea which project it's writing to.
+    parent = serializers.IntegerField(required=False, allow_null=True)
+    attachment = serializers.IntegerField(required=False, allow_null=True)
+
+
+class EngagementCycleSerializer(serializers.ModelSerializer):
+    """One month of a retainer, as the client and lead see it in a list."""
+
+    class Meta:
+        model = Project
+        fields = ["id", "code", "title", "stage", "quote_usd", "is_paid",
+                  "period_start", "period_end", "progress_pct"]
+        read_only_fields = fields
+
+
+class EngagementSerializer(serializers.ModelSerializer):
+    organisation_name = serializers.CharField(
+        source="organisation.name", read_only=True)
+    client_name = serializers.SerializerMethodField()
+    lead_name = serializers.SerializerMethodField()
+    product_line = ProductLineBriefSerializer(read_only=True)
+    status_label = serializers.CharField(source="get_status_display", read_only=True)
+    cycles = serializers.SerializerMethodField()
+    delivered_cycles = serializers.IntegerField(read_only=True)
+    billed_usd = serializers.DecimalField(
+        max_digits=12, decimal_places=2, read_only=True)
+    next_period_start = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Engagement
+        fields = ["id", "title", "description", "monthly_amount_usd",
+                  "billing_day", "status", "status_label", "started_on",
+                  "ends_on", "end_reason", "organisation", "organisation_name",
+                  "client_name", "lead", "lead_name", "product_line",
+                  "cycles", "delivered_cycles", "billed_usd",
+                  "next_period_start", "created_at"]
+        read_only_fields = fields
+
+    def get_client_name(self, obj):
+        return obj.client.full_name or obj.client.email
+
+    def get_lead_name(self, obj):
+        return obj.lead.full_name or obj.lead.email
+
+    def get_cycles(self, obj):
+        return EngagementCycleSerializer(
+            obj.cycles.order_by("-period_start"), many=True).data
+
+    def get_next_period_start(self, obj):
+        """What the client would be billed for next, or null if nothing is due.
+
+        Shown so a retainer never quietly stops without anybody noticing —
+        "next: 1 October" and "next: nothing" are very different states.
+        """
+        from . import engagements as service
+
+        if not obj.is_live:
+            return None
+        return service.next_period_start(obj)
+
+
+class EngagementCreateSerializer(serializers.ModelSerializer):
+    product_line = serializers.SlugRelatedField(
+        slug_field="slug", queryset=ProductLine.objects.filter(is_active=True))
+    service = serializers.PrimaryKeyRelatedField(
+        queryset=Service.objects.filter(is_active=True),
+        required=False, allow_null=True)
+
+    class Meta:
+        model = Engagement
+        fields = ["title", "description", "monthly_amount_usd", "billing_day",
+                  "started_on", "ends_on", "product_line", "service", "client"]
+
+    def validate_title(self, value):
+        if not value.strip():
+            raise serializers.ValidationError("Give the retainer a name.")
+        return value.strip()
+
+    def validate_monthly_amount_usd(self, value):
+        if value <= 0:
+            raise serializers.ValidationError("A retainer has to be worth something.")
+        return value
+
+    def validate(self, data):
+        ends = data.get("ends_on")
+        if ends and ends < data["started_on"]:
+            raise serializers.ValidationError(
+                {"ends_on": "It can't end before it starts."})
+        return data

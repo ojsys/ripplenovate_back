@@ -52,6 +52,10 @@ class Service(models.Model):
         ProductLine, on_delete=models.CASCADE, related_name="services"
     )
     name = models.CharField(max_length=100)
+    # For the public service page's URL. Unique within its line rather than
+    # globally: "Copywriting" could reasonably exist under two disciplines, and
+    # the line is already in the path.
+    slug = models.SlugField(max_length=120, blank=True)
     description = models.CharField(max_length=200, blank=True)
     typical_timeline = models.CharField(max_length=50, blank=True)
     is_active = models.BooleanField(default=True)
@@ -62,8 +66,25 @@ class Service(models.Model):
         constraints = [
             models.UniqueConstraint(
                 fields=["product_line", "name"], name="unique_service_per_line"
-            )
+            ),
+            models.UniqueConstraint(
+                fields=["product_line", "slug"], name="unique_service_slug_per_line",
+                condition=models.Q(slug__gt=""),
+            ),
         ]
+
+    def save(self, *args, **kwargs):
+        """Fill the slug from the name if nobody set one.
+
+        Derived rather than required so adding a service in the Django admin
+        stays a two-field job, and so every row written before this existed
+        gets one the first time it's saved.
+        """
+        if not self.slug:
+            from django.utils.text import slugify
+
+            self.slug = slugify(self.name)[:120]
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return f"{self.product_line.name} · {self.name}"
