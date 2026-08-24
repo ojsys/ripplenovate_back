@@ -10,6 +10,10 @@ urlpatterns = [
     path("projects/stats/admin", views.admin_stats),
     path("pipeline", views.pipeline),
     path("reviews", views.reviews),
+    # Retainers, and the utilisation figures behind them.
+    path("engagements", views.engagements),
+    path("engagements/<int:engagement_id>", views.engagement_detail),
+    path("utilisation", views.utilisation),
     path("reports", views.reports),
     path("analytics", views.analytics),
     path("tasks/<int:task_id>", views.task_detail),
@@ -17,6 +21,7 @@ urlpatterns = [
     path("tasks/<int:task_id>/submit", views.submit_task),
     path("tasks/<int:task_id>/approve", views.approve_task),
     path("tasks/<int:task_id>/request-changes", views.request_task_changes),
+    path("change-orders/<int:order_id>", views.withdraw_change_order),
     path("attachments/<int:attachment_id>", views.delete_attachment),
     path("attachments/<int:attachment_id>/download", views.download_attachment),
     *router.urls,
