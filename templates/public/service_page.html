@@ -52,6 +52,13 @@ the marketplace surface this platform deliberately doesn't have.
   .item span{font-size:13.5px;color:var(--muted)}
   .cta{display:inline-block;background:var(--accent);color:#fff;text-decoration:none;
        font-weight:600;font-size:16px;padding:15px 28px;border-radius:12px;margin-top:10px}
+  .quotes{display:flex;flex-direction:column;gap:14px;margin:22px 0}
+  blockquote{margin:0;background:var(--card);border:1px solid var(--rule);
+             border-left:3px solid var(--accent);border-radius:12px;padding:18px 20px}
+  blockquote p{margin:8px 0 10px;font-size:15.5px;line-height:1.65;color:var(--body)}
+  blockquote cite{font-style:normal;font-size:13px;font-weight:600;color:var(--ink)}
+  .stars{color:#E0A32E;font-size:14px;letter-spacing:1px}
+  .stars .dim{color:#D9D4CA}
   .how{background:var(--card);border:1px solid var(--rule);border-radius:14px;padding:24px 26px;margin:26px 0}
   .how ol{padding-left:22px;margin:0}
   .how li{margin-bottom:11px}
@@ -90,6 +97,19 @@ the marketplace surface this platform deliberately doesn't have.
       <strong>{{ s.name }}</strong>
       <span>{{ s.description|default:s.typical_timeline|default:"Fixed price, agreed up front" }}</span>
     </a>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  {% if reviews %}
+  <h2>What clients said</h2>
+  <div class="quotes">
+    {% for r in reviews %}
+    <blockquote>
+      <div class="stars" aria-label="{{ r.rating }} out of 5">{% for _ in "12345"|make_list %}{% if forloop.counter <= r.rating %}★{% else %}<span class="dim">★</span>{% endif %}{% endfor %}</div>
+      <p>“{{ r.comment }}”</p>
+      <cite>{{ r.company }}{% if r.service %} · {{ r.service }}{% endif %}</cite>
+    </blockquote>
     {% endfor %}
   </div>
   {% endif %}

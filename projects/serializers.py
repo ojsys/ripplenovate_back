@@ -182,7 +182,8 @@ class ProjectFeedbackSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = ProjectFeedback
-        fields = ["rating", "comment", "would_work_again", "created_at"]
+        fields = ["rating", "comment", "would_work_again", "may_publish",
+                  "created_at"]
         read_only_fields = ["created_at"]
 
     def validate_rating(self, value):

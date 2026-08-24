@@ -14,7 +14,7 @@ from accounts.uploads import validate_project_document
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.exceptions import PermissionDenied, ValidationError
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 
 from . import notifications
@@ -1442,9 +1442,43 @@ def admin_stats(request):
         })
         row["active"] += 1
         row["value_usd"] += project.quote_usd
+    # What this lead's own clients actually said. Not the public reviews —
+    # this is every review on their projects, consented or not, which
+    # `can_access_project` already permits them to read. It's the one signal
+    # that measures whether anybody was happy rather than whether the work
+    # arrived on time.
+    feedback_rows = (ProjectFeedback.objects
+                     .filter(project__in=qs)
+                     .select_related("project")
+                     .order_by("-created_at")[:5])
+    ratings = list(ProjectFeedback.objects
+                   .filter(project__in=qs)
+                   .values_list("rating", flat=True))
+
     return Response({
         "active_total": active.count(),
         "needs_quote": qs.filter(stage=Stage.SUBMITTED).count(),
+        "feedback": {
+            # Null rather than zero with nothing to average — "nobody has rated
+            # you" and "your clients rate you 0" are very different statements.
+            "average": (round(sum(ratings) / len(ratings), 1)
+                        if ratings else None),
+            "count": len(ratings),
+            "recent": [
+                {
+                    "id": row.id,
+                    "project_id": row.project_id,
+                    "project_title": row.project.title,
+                    "company": row.project.company or "A client",
+                    "rating": row.rating,
+                    "comment": row.comment,
+                    "would_work_again": row.would_work_again,
+                    "may_publish": row.may_publish,
+                    "created_at": row.created_at,
+                }
+                for row in feedback_rows
+            ],
+        },
         "needs_assign": qs.filter(stage=Stage.PAID, expert__isnull=True).count(),
         "contracted_value_usd": sum(p.quote_usd for p in active),
         # Per-discipline breakdown, busiest first.
@@ -1815,3 +1849,26 @@ def engagement_detail(request, engagement_id):
 
     engagement.refresh_from_db()
     return Response(EngagementSerializer(engagement).data)
+
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def reviews(request):
+    """Consented client reviews, plus the honest aggregate.
+
+    Public on purpose — this is the landing page's social proof, and a visitor
+    deciding whether to trust the platform hasn't signed in yet.
+
+    Only reviews whose author agreed we may quote them. The average beside them
+    is computed over *every* review, consented or not, because a wall of
+    testimonials is understood to be curated and a rating is not.
+    """
+    from . import reviews as service
+
+    line = request.query_params.get("product_line")
+    return Response({
+        "reviews": service.published(
+            limit=int(request.query_params.get("limit") or 12),
+            line_slug=line),
+        "summary": service.summary(line_slug=line),
+    })

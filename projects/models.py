@@ -669,6 +669,13 @@ class ProjectFeedback(models.Model):
     # 4-star project they'd never repeat and a 4-star project they'd rebook are
     # different businesses.
     would_work_again = models.BooleanField(null=True, blank=True)
+    # Whether this client agreed we may quote them publicly.
+    #
+    # Default False and asked explicitly, because the form that collects this
+    # feedback promises it goes to the delivery lead and nobody else. Publishing
+    # on the strength of that would break the promise the words were written
+    # under — consent given for one audience is not consent for another.
+    may_publish = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

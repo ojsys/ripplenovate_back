@@ -9,6 +9,7 @@ router.register("projects", views.ProjectViewSet, basename="project")
 urlpatterns = [
     path("projects/stats/admin", views.admin_stats),
     path("pipeline", views.pipeline),
+    path("reviews", views.reviews),
     path("reports", views.reports),
     path("analytics", views.analytics),
     path("tasks/<int:task_id>", views.task_detail),

@@ -34,6 +34,7 @@ from django.utils.html import strip_tags
 
 from accounts.models import SiteSettings
 from catalog import public
+from projects import reviews
 from catalog.models import ProductLine
 
 
@@ -136,6 +137,10 @@ class Command(BaseCommand):
             "services": services,
             "timeline": "",
             "stats": public.line_stats(line),
+            # Consented reviews only — see projects/reviews.py. This is where a
+            # prospect actually lands from a search, so it's the page where
+            # social proof is worth the most.
+            "reviews": reviews.published(limit=3, line_slug=line.slug),
             "parent": False,
         })
         context["structured_data"] = self._json_ld(
@@ -159,6 +164,7 @@ class Command(BaseCommand):
             "services": [],
             "timeline": service.typical_timeline,
             "stats": public.service_stats(service),
+            "reviews": reviews.published(limit=2, line_slug=line.slug),
             "parent": True,
         })
         context["structured_data"] = self._json_ld(
