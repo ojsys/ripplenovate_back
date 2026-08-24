@@ -16,6 +16,7 @@ urlpatterns = [
     path("auth/change-password", views.change_password),
     path("notifications", views.notifications),
     path("terms", views.terms),
+    path("guide/admin", views.admin_guide),
     path("users/<int:user_id>/offboard", views.offboard_lead),
     # A client's company: who else can see the work, and who pays.
     path("organisation", views.my_organisation),

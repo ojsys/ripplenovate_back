@@ -23,6 +23,7 @@ def _initials(name):
 
 
 class TaskSerializer(serializers.ModelSerializer):
+    
     assignee_name = serializers.SerializerMethodField()
     # `done` is now a view of `status`, kept so existing boards keep reading the
     # same field while the lifecycle grows underneath them.

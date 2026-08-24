@@ -8,6 +8,7 @@ money-shaped assertions here are about what removal *refuses* to do.
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
+from django.core import mail
 from django.test import TestCase
 from rest_framework.test import APIClient
 
@@ -278,3 +279,128 @@ class TeamAccessTests(TestCase):
         recipients = {addr for m in mail.outbox for addr in m.to}
         self.assertIn(self.primary.email, recipients)
         self.assertIn(self.second.email, recipients)
+
+
+class AddingToALiveProjectTests(TestCase):
+    """Putting somebody on a project that's already running.
+
+    The reported bug: a lead's roster showed experts in **My Team** who could
+    not be given a task. The task assignee list is the *project's* team, so
+    anyone not picked at kickoff was unreachable — and the one control that
+    looked like it would help pointed at the assign screen, which does nothing
+    once the project has left Paid.
+
+    The endpoint was always there. Nothing called it.
+    """
+
+    def setUp(self):
+        self.line = ProductLine.objects.get(slug="design-creative")
+        self.lead = User.objects.create_user(
+            "livelead@ril.team", "x", full_name="A Lead",
+            role=User.Role.DELIVERY_LEAD)
+        self.lead.product_lines.add(self.line)
+        self.picked = User.objects.create_user(
+            "livepicked@ril.dev", "x", full_name="Picked At Kickoff",
+            role=User.Role.EXPERT, lead=self.lead)
+        self.picked.product_lines.add(self.line)
+        # On the lead's roster, but not on the project. This is the person the
+        # bug made unreachable.
+        self.bench = User.objects.create_user(
+            "livebench@ril.dev", "x", full_name="On My Team",
+            role=User.Role.EXPERT, lead=self.lead)
+        self.bench.product_lines.add(self.line)
+        self.customer = User.objects.create_user(
+            "liveclient@acme.io", "x", role=User.Role.CLIENT)
+
+        self.project = Project.objects.create(
+            title="A rebrand", client=self.customer, category="Brand identity",
+            description="…", product_line=self.line, lead=self.lead,
+            expert=self.picked, stage=Project.Stage.IN_PROGRESS, quote_usd=5000)
+        self.project.experts.add(self.picked)
+
+    def url(self, suffix=""):
+        return f"/api/projects/{self.project.id}{suffix}"
+
+    def test_a_roster_expert_starts_off_the_project(self):
+        """The state the bug report describes."""
+        team = as_user(self.lead).get(self.url()).data["team"]
+        self.assertEqual([m["id"] for m in team], [self.picked.id])
+
+    def test_a_task_cannot_be_given_to_somebody_off_the_project(self):
+        response = as_user(self.lead).post(
+            self.url("/tasks"),
+            {"title": "Some work", "assignee": self.bench.id,
+             "amount_usd": "100"}, format="json")
+        self.assertEqual(response.status_code, 400)
+
+    def test_a_lead_can_add_them_mid_delivery(self):
+        response = as_user(self.lead).post(
+            self.url("/experts"), {"experts": [self.bench.id]}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertIn(self.bench.id,
+                      {m["id"] for m in response.data["team"]})
+
+    def test_and_then_give_them_a_task(self):
+        """The whole point — the two steps together."""
+        as_user(self.lead).post(
+            self.url("/experts"), {"experts": [self.bench.id]}, format="json")
+        response = as_user(self.lead).post(
+            self.url("/tasks"),
+            {"title": "Some work", "assignee": self.bench.id,
+             "amount_usd": "100"}, format="json")
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(Task.objects.get(title="Some work").assignee_id,
+                         self.bench.id)
+
+    def test_it_works_at_every_live_stage(self):
+        for stage in (Project.Stage.PAID, Project.Stage.IN_PROGRESS,
+                      Project.Stage.REVIEW):
+            with self.subTest(stage=stage):
+                self.project.experts.set([self.picked])
+                self.project.stage = stage
+                self.project.save(update_fields=["stage"])
+                response = as_user(self.lead).post(
+                    self.url("/experts"), {"experts": [self.bench.id]},
+                    format="json")
+                self.assertEqual(response.status_code, 200, response.data)
+
+    def test_adding_somebody_already_on_it_is_harmless(self):
+        response = as_user(self.lead).post(
+            self.url("/experts"), {"experts": [self.picked.id]}, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.experts.count(), 1)
+
+    def test_a_roster_expert_is_reachable_whatever_they_are_tagged_with(self):
+        """Product lines are copied from whoever signed somebody up, not
+        curated — so they must not decide who a lead can staff."""
+        self.bench.product_lines.clear()
+        response = as_user(self.lead).post(
+            self.url("/experts"), {"experts": [self.bench.id]}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+
+    def test_somebody_elses_expert_still_needs_the_discipline(self):
+        other_lead = User.objects.create_user(
+            "liveother@ril.team", "x", role=User.Role.DELIVERY_LEAD)
+        theirs = User.objects.create_user(
+            "livetheirs@ril.dev", "x", role=User.Role.EXPERT, lead=other_lead)
+        theirs.product_lines.add(ProductLine.objects.get(slug="software-web"))
+        response = as_user(self.lead).post(
+            self.url("/experts"), {"experts": [theirs.id]}, format="json")
+        self.assertEqual(response.status_code, 400)
+
+    def test_the_first_person_added_becomes_answerable(self):
+        self.project.experts.clear()
+        self.project.expert = None
+        self.project.save(update_fields=["expert"])
+        as_user(self.lead).post(
+            self.url("/experts"), {"experts": [self.bench.id]}, format="json")
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.expert_id, self.bench.id)
+
+    def test_they_are_told_they_are_on_it(self):
+        mail.outbox = []
+        as_user(self.lead).post(
+            self.url("/experts"), {"experts": [self.bench.id]}, format="json")
+        self.assertIn(self.bench.email,
+                      {addr for m in mail.outbox for addr in m.to})

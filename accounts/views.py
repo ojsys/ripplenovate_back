@@ -37,6 +37,7 @@ from .emails import (
     send_welcome_client,
 )
 from . import impersonation
+from .guide import ADMIN_GUIDE
 from .models import (
     EmailToken,
     ImpersonationEvent,
@@ -1456,3 +1457,16 @@ def _unsettled_balance(user):
         return earnings_service.available_balance(user)
     except Exception:  # noqa: BLE001 — reporting a balance must not block the move
         return Decimal("0.00")
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def admin_guide(request):
+    """The admin half of the help page.
+
+    Served rather than bundled: everything in the frontend's `guide.js` is
+    readable by anyone who opens devtools, so gating the admin content there
+    would have been a gesture. This is the check that actually holds.
+    """
+    _require_admin(request.user)
+    return Response({"entries": ADMIN_GUIDE})

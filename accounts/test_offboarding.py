@@ -262,3 +262,59 @@ class OffboardingTests(TestCase):
         theirs = [m for m in mail.outbox if self.expert.email in m.to]
         self.assertTrue(theirs)
         self.assertIn("earned", " ".join(m.body for m in theirs).lower())
+
+
+class AdminGuideTests(TestCase):
+    """The admin help content, served rather than bundled.
+
+    It lives on the server because everything in the frontend's `guide.js`
+    ships in the JavaScript bundle and is readable by anyone who opens
+    devtools — gating it in the UI alone would have been a gesture. This is the
+    check that actually holds.
+    """
+
+    def setUp(self):
+        self.admin = User.objects.create_superuser("agboss@ril.team", "x")
+        self.lead = User.objects.create_user(
+            "aglead@ril.team", "x", role=User.Role.DELIVERY_LEAD)
+        self.expert = User.objects.create_user(
+            "agexpert@ril.dev", "x", role=User.Role.EXPERT)
+        self.buyer = User.objects.create_user(
+            "agbuyer@acme.io", "x", role=User.Role.CLIENT)
+
+    def test_an_admin_gets_the_content(self):
+        response = as_user(self.admin).get("/api/guide/admin")
+        self.assertEqual(response.status_code, 200)
+        entries = response.data["entries"]
+        ids = {e["id"] for e in entries}
+        self.assertIn("admin-impersonate", ids)
+        self.assertIn("admin-offboard", ids)
+        self.assertIn("admin-settings", ids)
+
+    def test_nobody_else_does(self):
+        for who in (self.lead, self.expert, self.buyer):
+            with self.subTest(who=who.email):
+                self.assertEqual(
+                    as_user(who).get("/api/guide/admin").status_code, 403)
+
+    def test_a_signed_out_visitor_does_not(self):
+        self.assertIn(APIClient().get("/api/guide/admin").status_code, (401, 403))
+
+    def test_staff_alone_is_not_enough(self):
+        """Same rule as everywhere else — staff see the books, not the levers."""
+        staffer = User.objects.create_user(
+            "agstaff@ril.team", "x", role=User.Role.DELIVERY_LEAD, is_staff=True)
+        self.assertEqual(
+            as_user(staffer).get("/api/guide/admin").status_code, 403)
+
+    def test_every_entry_has_the_shape_the_page_renders(self):
+        """The page renders server entries and bundled ones identically, so a
+        malformed one here is a blank card rather than an error."""
+        entries = as_user(self.admin).get("/api/guide/admin").data["entries"]
+        for entry in entries:
+            with self.subTest(entry=entry.get("id")):
+                self.assertTrue(entry.get("id"))
+                self.assertTrue(entry.get("section"))
+                self.assertTrue(entry.get("q"))
+                self.assertIsInstance(entry.get("a", []), list)
+                self.assertIsInstance(entry.get("list", []), list)
