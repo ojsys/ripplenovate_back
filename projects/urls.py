@@ -10,6 +10,12 @@ urlpatterns = [
     path("projects/stats/admin", views.admin_stats),
     path("pipeline", views.pipeline),
     path("reviews", views.reviews),
+    path("leaderboard", views.leaderboard),
+    path("request-lead", views.request_lead),
+    # A client asking for a different delivery lead, and the admin queue.
+    path("projects/<int:pk>/lead-change", views.request_lead_change),
+    path("lead-changes", views.lead_change_queue),
+    path("lead-changes/<int:pk>/resolve", views.resolve_lead_change),
     # Retainers, and the utilisation figures behind them.
     path("engagements", views.engagements),
     path("engagements/<int:engagement_id>", views.engagement_detail),

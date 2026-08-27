@@ -29,6 +29,7 @@ from .models import (
     Attachment,
     ChangeOrder,
     Engagement,
+    LeadChangeRequest,
     Project,
     ProjectFeedback,
     RevisionRequest,
@@ -212,7 +213,7 @@ class ProjectViewSet(mixins.ListModelMixin,
         aren't in that cache, so we re-fetch to return current data.
         """
         fresh = Project.objects.select_related(
-            "client", "expert", "product_line", "service", "feedback"
+            "client", "expert", "lead", "product_line", "service", "feedback"
         ).prefetch_related(
             "experts", "tasks", "activity", "activity__attachments",
             "activity__replies", "activity__replies__attachments", "attachments",
@@ -546,13 +547,33 @@ class ProjectViewSet(mixins.ListModelMixin,
             return self._detail(project)
 
         project.experts.add(*added)
+        fields = []
         # A team with nobody answerable for it isn't a team. If the project has
         # no primary yet, the first person on it becomes one.
         if not project.expert_id:
             project.expert = added[0]
-            project.save(update_fields=["expert"])
-        log_activity(project, request.user,
-                     f"Added {self._names(added)} to the delivery team.")
+            fields.append("expert")
+        # Putting the first team on a brief *is* the start of delivery, whether
+        # it happens on the assign screen or here. Leaving it at Paid stranded
+        # the work: the whole platform reads Paid as "nobody has been asked to
+        # start yet", so the expert's My Work board skipped the project
+        # entirely, `progress_pct` ignored the task list, and utilisation
+        # counted them idle — while their tasks sat there, assigned and
+        # invisible to them.
+        kickoff = project.stage == Stage.PAID
+        if kickoff:
+            project.stage = Stage.IN_PROGRESS
+            fields.append("stage")
+            # Same catch-up as `assign`: briefs paid before leads were tracked.
+            if not project.lead_id:
+                project.lead = request.user
+                fields.append("lead")
+        if fields:
+            project.save(update_fields=fields)
+        log_activity(
+            project, request.user,
+            f"Assigned {self._names(added)} and kicked off delivery." if kickoff
+            else f"Added {self._names(added)} to the delivery team.")
         notifications.notify_experts_assigned(project, added)
         return self._detail(project)
 
@@ -1872,3 +1893,201 @@ def reviews(request):
             line_slug=line),
         "summary": service.summary(line_slug=line),
     })
+
+
+# ---------------------------------------------------------------------------
+# Asking for a different delivery lead
+# ---------------------------------------------------------------------------
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def request_lead_change(request, pk):
+    """The client asking to be moved to a different delivery lead.
+
+    Goes to an administrator, never to the lead being complained about. A
+    client who has to raise this with the person they're unhappy with will
+    simply not raise it.
+    """
+    project = Project.objects.select_related("lead", "client").filter(pk=pk).first()
+    if not project:
+        return Response({"detail": "Project not found."},
+                        status=status.HTTP_404_NOT_FOUND)
+    if project.client_id != request.user.id and not request.user.is_superuser:
+        raise PermissionDenied("Only the client can ask for a different lead.")
+    if project.stage in Project.CLOSED_STAGES:
+        raise ValidationError("This project has finished.")
+    if not project.lead_id:
+        raise ValidationError("Nobody is running this project yet.")
+    if project.lead_change_requests.filter(
+            status=LeadChangeRequest.Status.OPEN).exists():
+        raise ValidationError("You've already asked — we're looking at it.")
+
+    reason = (request.data.get("reason") or "").strip()
+    if not reason:
+        raise ValidationError(
+            "Tell us what isn't working, so we can put the right person on it."
+        )
+
+    entry = LeadChangeRequest.objects.create(
+        project=project, requested_by=request.user, reason=reason,
+        previous_lead=project.lead,
+    )
+    # Not written to the activity feed: the outgoing lead reads that feed, and
+    # they should hear this from an administrator rather than by scrolling.
+    notifications.notify_lead_change_requested(entry)
+    return Response({"detail": "Thanks — an administrator will look at this.",
+                     "id": entry.id},
+                    status=status.HTTP_201_CREATED)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def lead_change_queue(request):
+    """Open requests, for an administrator to act on."""
+    if not request.user.is_superuser:
+        raise PermissionDenied("Only an administrator can see these.")
+    rows = (LeadChangeRequest.objects
+            .filter(status=LeadChangeRequest.Status.OPEN)
+            .select_related("project", "project__client", "previous_lead"))
+    return Response([
+        {
+            "id": row.id,
+            "project_id": row.project_id,
+            "project_code": row.project.code,
+            "project_title": row.project.title,
+            "project_stage": row.project.stage,
+            "client": row.project.client.full_name or row.project.client.email,
+            "company": row.project.company,
+            "current_lead": (row.previous_lead.full_name or row.previous_lead.email
+                             if row.previous_lead else "—"),
+            "current_lead_id": row.previous_lead_id,
+            "reason": row.reason,
+            "created_at": row.created_at,
+        }
+        for row in rows
+    ])
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def resolve_lead_change(request, pk):
+    """An administrator reassigning the project, or declining to.
+
+    Reassigning moves the lead share with it — earnings credit at completion
+    from whoever holds the project then, so the incoming lead earns the 15% and
+    the outgoing one earns nothing here. Deliberate: the person who delivers it
+    is the person who's paid for it. The response says so out loud.
+    """
+    if not request.user.is_superuser:
+        raise PermissionDenied("Only an administrator can resolve these.")
+    entry = (LeadChangeRequest.objects
+             .select_related("project", "previous_lead").filter(pk=pk).first())
+    if not entry:
+        return Response({"detail": "No request with that id."},
+                        status=status.HTTP_404_NOT_FOUND)
+    if not entry.is_open:
+        raise ValidationError("That request has already been dealt with.")
+
+    decision = (request.data.get("decision") or "").strip()
+    note = (request.data.get("note") or "").strip()
+
+    if decision == "decline":
+        if not note:
+            raise ValidationError(
+                "Say why, so the client hears something more than “no”.")
+        entry.status = LeadChangeRequest.Status.DECLINED
+        entry.resolution_note = note
+    elif decision == "reassign":
+        successor = User.objects.filter(
+            id=request.data.get("new_lead"), role=Role.DELIVERY_LEAD).first()
+        if not successor:
+            raise ValidationError("Name the delivery lead taking it on.")
+        if successor.id == entry.project.lead_id:
+            raise ValidationError("That's the lead they asked to move away from.")
+        if not successor.is_approved:
+            raise ValidationError("That lead's account is still being reviewed.")
+
+        project = entry.project
+        project.lead = successor
+        project.save(update_fields=["lead"])
+        entry.new_lead = successor
+        entry.status = LeadChangeRequest.Status.REASSIGNED
+        entry.resolution_note = note
+        log_activity(
+            project, request.user,
+            f"Moved the project to {successor.full_name or successor.email} "
+            "as its delivery lead.",
+        )
+    else:
+        raise ValidationError("Decide either reassign or decline.")
+
+    entry.resolved_by = request.user
+    entry.resolved_at = timezone.now()
+    entry.save(update_fields=["status", "new_lead", "resolution_note",
+                              "resolved_by", "resolved_at"])
+    notifications.notify_lead_change_resolved(entry)
+    return Response({
+        "detail": ("Project reassigned." if decision == "reassign"
+                   else "Request declined."),
+        "status": entry.status,
+        # Stated rather than assumed: an admin should know what they just did
+        # to somebody's earnings.
+        "lead_share_note": (
+            "The incoming lead now earns the delivery-lead share when this "
+            "project completes. The outgoing lead earns nothing on it."
+            if decision == "reassign" else ""
+        ),
+    })
+
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def leaderboard(request):
+    """Top delivery leads and experts. Public.
+
+    A client who hasn't signed up yet is exactly the person this is for, so it
+    can't sit behind a login. Only people with enough delivered work to say
+    anything meaningful appear, and everybody who does appear brings their
+    numbers with them rather than just a rank.
+    """
+    from . import leaderboard as board
+
+    line = request.query_params.get("product_line")
+    limit = min(int(request.query_params.get("limit") or 8), 25)
+    return Response({
+        "leads": board.leads(limit=limit, line_slug=line),
+        "experts": board.experts(limit=limit, line_slug=line),
+        "min_delivered": board.MIN_DELIVERED,
+    })
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def request_lead(request):
+    """A client naming the delivery lead they'd like on a brief they're posting.
+
+    A request, not an assignment: the lead still has to pick the brief up, and
+    the intake queue still works the way it always did. Recorded on the project
+    so the named lead sees they were asked for.
+    """
+    project = Project.objects.filter(
+        pk=request.data.get("project"), client=request.user).first()
+    if not project:
+        return Response({"detail": "Project not found."},
+                        status=status.HTTP_404_NOT_FOUND)
+    if project.lead_id:
+        raise ValidationError(
+            "This brief already has a delivery lead. Ask for a different one "
+            "from the project page instead."
+        )
+    wanted = User.objects.filter(
+        id=request.data.get("lead"), role=Role.DELIVERY_LEAD).first()
+    if not wanted or not wanted.is_approved:
+        raise ValidationError("We couldn't find that delivery lead.")
+
+    log_activity(
+        project, request.user,
+        f"Asked for {wanted.full_name or wanted.email} to run this project.",
+    )
+    notifications.notify_lead_requested(project, wanted)
+    return Response({"detail": f"We've let {wanted.full_name or wanted.email} know."})

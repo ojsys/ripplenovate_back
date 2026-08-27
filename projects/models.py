@@ -639,6 +639,73 @@ class Task(models.Model):
         return self.amount_usd > 0
 
 
+class LeadChangeRequest(models.Model):
+    """A client asking for a different delivery lead.
+
+    The client never chose their lead — a brief is picked up by whoever runs
+    that discipline — so when the relationship isn't working there was nothing
+    they could do about it except abandon the project. Revisions fix bad work;
+    this fixes a bad fit, which is a different problem and had no route at all.
+
+    Deliberately routed to an **administrator** rather than to the lead being
+    complained about, for the obvious reason.
+
+    Worth knowing what reassignment does to the money: the lead share is
+    credited at completion from whoever holds `project.lead` at that moment, so
+    a new lead earns the whole 15% and the outgoing one earns nothing on this
+    project. That's the right default when somebody is replaced for not
+    delivering, and it is visible here rather than buried — an admin resolving
+    one of these is told before they act.
+    """
+
+    class Status(models.TextChoices):
+        OPEN = "open", "Waiting on an administrator"
+        REASSIGNED = "reassigned", "Reassigned"
+        DECLINED = "declined", "Declined"
+        WITHDRAWN = "withdrawn", "Withdrawn by the client"
+
+    project = models.ForeignKey(
+        Project, on_delete=models.CASCADE, related_name="lead_change_requests"
+    )
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True,
+        related_name="lead_change_requests",
+    )
+    # Mandatory. "Change my lead" with no reason gives an admin nothing to act
+    # on and the outgoing lead nothing to learn from.
+    reason = models.TextField()
+    # Snapshotted, because `project.lead` moves when this is granted and the
+    # record has to still say who was being complained about.
+    previous_lead = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True,
+        related_name="lead_changes_away",
+    )
+    new_lead = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="lead_changes_to",
+    )
+    status = models.CharField(
+        max_length=12, choices=Status.choices, default=Status.OPEN
+    )
+    resolved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="lead_changes_resolved",
+    )
+    resolution_note = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+
+    def __str__(self):
+        return f"{self.project.code} · lead change ({self.status})"
+
+    @property
+    def is_open(self):
+        return self.status == self.Status.OPEN
+
+
 class ProjectFeedback(models.Model):
     """What the client thought, kept private.
 

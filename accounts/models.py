@@ -131,6 +131,16 @@ class User(AbstractUser):
     # Paystack transfer recipient, reused across payouts for the same account.
     paystack_recipient_code = models.CharField(max_length=100, blank=True)
 
+    # Whether this partner appears on the public leaderboard. Opt-out rather
+    # than opt-in: being listed is part of delivering on a platform that sells
+    # its people, and an empty leaderboard helps nobody. But somebody who would
+    # rather not be ranked in public gets to say so.
+    show_in_leaderboard = models.BooleanField(
+        "Show on the public leaderboard", default=True,
+        help_text="Delivery leads and experts with enough delivered work appear "
+                  "on the public leaderboard. Untick to be left off it.",
+    )
+
     is_email_verified = models.BooleanField(default=False)
 
     # --- Application & onboarding (delivery leads and business developers) ---

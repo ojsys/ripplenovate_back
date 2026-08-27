@@ -738,3 +738,107 @@ def notify_engagement_ended(engagement, final_cycle=None):
         heading="This retainer has ended",
         paragraphs=paragraphs,
     )
+
+
+@_safe
+def notify_lead_change_requested(entry):
+    """Tell the administrators. Deliberately not the lead being complained about.
+
+    They hear it from a person, once somebody has decided what to do — not as
+    a notification saying a client has asked to be moved away from them.
+    """
+    User = get_user_model()
+    admins = [u.email for u in User.objects.filter(is_superuser=True, is_active=True)]
+    if not admins:
+        return
+    project = entry.project
+    send_brand_email(
+        subject=f"Delivery lead change requested: {project.code}",
+        to=admins,
+        heading="A client has asked for a different delivery lead",
+        paragraphs=[
+            f"{_client_name(project)} has asked to be moved off "
+            f"{entry.previous_lead and (entry.previous_lead.full_name or entry.previous_lead.email)} "
+            f"on “{project.title}” ({project.stage}).",
+            f"What they said: “{entry.reason}”",
+            "Reassigning moves the delivery-lead share with it — whoever holds "
+            "the project at completion earns it.",
+        ],
+        cta=("Open the project", _project_url(project)),
+    )
+
+
+@_safe
+def notify_lead_change_resolved(entry):
+    """Tell the client either way, and both leads when it actually moved."""
+    project = entry.project
+    reassigned = entry.status == entry.Status.REASSIGNED
+
+    send_brand_email(
+        subject=f"About your request on {project.title}",
+        to=project.client.email,
+        heading=("Your project has a new delivery lead" if reassigned
+                 else "About your delivery lead request"),
+        paragraphs=(
+            [f"Hi {project.client.full_name or 'there'},",
+             f"{entry.new_lead and (entry.new_lead.full_name or entry.new_lead.email)} "
+             "is now running your project. They'll pick up where things stand and "
+             "be in touch.",
+             entry.resolution_note or ""]
+            if reassigned else
+            [f"Hi {project.client.full_name or 'there'},",
+             "We've looked at your request to change delivery lead and we're "
+             "keeping the current one on this project.",
+             entry.resolution_note]
+        ),
+        cta=("Open the project", _project_url(project)),
+    )
+
+    if not reassigned:
+        return
+    if entry.new_lead:
+        send_brand_email(
+            subject=f"You're now running {project.title}",
+            to=entry.new_lead.email,
+            heading="A project has been moved to you",
+            paragraphs=[
+                f"“{project.title}” ({project.stage}) is now yours to run.",
+                "The team, the tasks and everything delivered so far are "
+                "unchanged. The delivery-lead share on completion is yours.",
+            ],
+            cta=("Open the project", _project_url(project)),
+        )
+    if entry.previous_lead:
+        send_brand_email(
+            subject=f"{project.title} has moved to another delivery lead",
+            to=entry.previous_lead.email,
+            heading="A project has been reassigned",
+            paragraphs=[
+                f"“{project.title}” has been moved to another delivery lead at "
+                "the client's request.",
+                "Anything you've already earned is unaffected. The delivery-lead "
+                "share on this project goes to whoever completes it.",
+                "Your administrator can talk you through it.",
+            ],
+        )
+
+
+@_safe
+def notify_lead_requested(project, wanted):
+    """Tell a lead a client asked for them by name.
+
+    Worth sending: it's the strongest signal a lead gets that the work they've
+    done is bringing more in, and the brief is still sitting in an open queue
+    anybody could claim.
+    """
+    send_brand_email(
+        subject=f"A client asked for you: {project.title}",
+        to=wanted.email,
+        heading="A client has asked for you by name",
+        paragraphs=[
+            f"{_client_name(project)} has posted “{project.title}” and asked "
+            "for you to run it.",
+            "It's still in the open queue — quote it to take it on.",
+        ],
+        cta=("Open the brief", _project_url(project)),
+    )

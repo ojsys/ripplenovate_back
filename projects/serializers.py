@@ -310,6 +310,10 @@ class ProjectDetailSerializer(ProjectListSerializer):
     # can. Sent so the board can explain the rule in place rather than letting
     # someone discover it by getting a 403.
     completion_block = serializers.SerializerMethodField()
+    # Who is running this. Never exposed before, which meant a client could see
+    # the experts delivering their project but not the one person accountable
+    # for it — and had no way to name them if they needed to raise something.
+    lead_name = serializers.SerializerMethodField()
     # The refund position, so a lead cancelling a paid project can see what's
     # actually returnable rather than guessing from the quote.
     collected_usd = serializers.DecimalField(
@@ -342,6 +346,7 @@ class ProjectDetailSerializer(ProjectListSerializer):
             "expert_pool_usd", "allocated_usd", "unallocated_usd",
             "uses_task_payouts", "open_revision", "revision_history",
             "completion_block", "cancelled_at", "cancellation_reason",
+            "lead", "lead_name",
             "collected_usd", "refunded_usd", "refundable_usd", "free_refund_usd",
             "change_orders", "change_orders_usd", "contract_usd",
             "feedback", "can_leave_feedback",
@@ -400,6 +405,11 @@ class ProjectDetailSerializer(ProjectListSerializer):
         if not self._sees_delivery(obj):
             return []
         return TaskSerializer(obj.tasks.all(), many=True).data
+
+    def get_lead_name(self, obj):
+        if not obj.lead_id or not obj.lead:
+            return ""
+        return obj.lead.full_name or obj.lead.email
 
     def get_completion_block(self, obj):
         if obj.stage != Project.Stage.REVIEW:

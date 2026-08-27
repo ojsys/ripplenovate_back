@@ -134,6 +134,49 @@ class TeamTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.project.experts.count(), 1)
 
+    def test_building_the_first_team_here_kicks_off_delivery(self):
+        """The project page can start delivery too, not just the assign screen.
+
+        It used to leave the brief sitting at Paid, which the rest of the
+        platform reads as "nobody has been asked to start" — so the expert's
+        board skipped it and the task they'd just been given was invisible to
+        them.
+        """
+        response = as_user(self.lead).post(
+            self.url("/experts"), {"experts": [self.ada.id]}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.stage, Project.Stage.IN_PROGRESS)
+        self.assertEqual(self.project.expert_id, self.ada.id)
+
+    def test_a_task_assigned_this_way_reaches_the_experts_board(self):
+        """The whole complaint, end to end."""
+        as_user(self.lead).post(
+            self.url("/experts"), {"experts": [self.chidi.id]}, format="json")
+        created = as_user(self.lead).post(
+            self.url("/tasks"),
+            {"title": "Their piece", "assignee": self.chidi.id,
+             "amount_usd": "250"}, format="json")
+        self.assertEqual(created.status_code, 201, created.data)
+
+        board = as_user(self.chidi).get("/api/projects")
+        listed = {j["id"]: j["stage"] for j in board.data}
+        self.assertEqual(listed.get(self.project.id),
+                         Project.Stage.IN_PROGRESS.value)
+        detail = as_user(self.chidi).get(self.url())
+        self.assertIn(
+            self.chidi.id,
+            [t["assignee"] for t in detail.data["tasks"]])
+
+    def test_adding_someone_mid_delivery_does_not_move_the_stage(self):
+        self.assign(expert=self.ada.id)
+        self.project.stage = Project.Stage.REVIEW
+        self.project.save(update_fields=["stage"])
+        as_user(self.lead).post(
+            self.url("/experts"), {"experts": [self.chidi.id]}, format="json")
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.stage, Project.Stage.REVIEW)
+
     def test_the_team_cannot_be_built_before_the_client_pays(self):
         self.project.stage = Project.Stage.QUOTED
         self.project.save(update_fields=["stage"])
