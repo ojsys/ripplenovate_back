@@ -444,11 +444,20 @@ class Project(models.Model):
     def open_revision(self):
         """The revision the client is still waiting on, or None.
 
-        Open means requested and not yet resubmitted. Two things read this: the
-        client's project page, so the request stays visible until it's answered,
-        and completion, which a lead may not force while one stands.
+        Open means requested and not yet resubmitted. Three things read this:
+        the client's project page, so the request stays visible until it's
+        answered; completion, which a lead may not force while one stands; and
+        the delivery board, which flags the project so the team can find it
+        without going back to the notification that told them.
+
+        Read through `revision_requests.all()` rather than a filter, so a
+        prefetched list — the board, which asks this once per row — is answered
+        from cache instead of costing a query per project. Rounds are a
+        handful; fetching them all is cheap. Ordering matches the model's
+        (newest first), so this picks the same row the filter did.
         """
-        return self.revision_requests.filter(resolved_at__isnull=True).first()
+        return next((r for r in self.revision_requests.all()
+                     if r.resolved_at is None), None)
 
     def client_silence_block(self):
         """Why a lead may not close this over the client's head — or None.

@@ -236,6 +236,13 @@ class ProjectListSerializer(serializers.ModelSerializer):
     days_overdue = serializers.IntegerField(read_only=True, allow_null=True)
     is_on_time = serializers.BooleanField(read_only=True, allow_null=True)
     days_late = serializers.IntegerField(read_only=True, allow_null=True)
+    # Whether the client is waiting on rework *right now*. `revision_rounds`
+    # can't answer that — it counts every round ever, so a project that was
+    # sent back once and long since re-delivered reads identically to one
+    # sitting on the team's desk. The board needs the difference: without it a
+    # returned project is just another "In Progress" row, and the only thing
+    # that ever said otherwise was a notification.
+    has_open_revision = serializers.SerializerMethodField()
 
     class Meta:
         model = Project
@@ -244,7 +251,7 @@ class ProjectListSerializer(serializers.ModelSerializer):
             "quote_usd", "expert", "expert_name", "progress_pct", "is_paid",
             "target_date", "created_at", "product_line", "service_name",
             "is_overdue", "days_overdue", "is_on_time", "days_late",
-            "revision_rounds",
+            "revision_rounds", "has_open_revision",
         ]
         # Output only. Lifecycle fields are moved by the viewset's actions (which
         # log activity and notify), never written straight from a request body.
@@ -260,6 +267,9 @@ class ProjectListSerializer(serializers.ModelSerializer):
 
     def get_expert_name(self, obj):
         return obj.expert.full_name if obj.expert else ""
+
+    def get_has_open_revision(self, obj):
+        return obj.open_revision is not None
 
 
 class TeamMemberSerializer(serializers.Serializer):

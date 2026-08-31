@@ -6,7 +6,7 @@ from pathlib import Path
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
-from django.db.models import F, Q
+from django.db.models import Exists, F, OuterRef, Q
 from django.http import FileResponse, Http404
 from django.utils import timezone
 
@@ -170,7 +170,10 @@ class ProjectViewSet(mixins.ListModelMixin,
             "client", "expert", "product_line", "service"
         ).prefetch_related("experts", "tasks", "activity",
                            "activity__attachments", "activity__replies",
-                           "activity__replies__attachments", "attachments")
+                           "activity__replies__attachments", "attachments",
+                           # The board flags every row the client has sent
+                           # back, so `open_revision` is asked once per project.
+                           "revision_requests")
         if user.is_superuser:
             return base
         if user.role == Role.DELIVERY_LEAD:
@@ -1501,6 +1504,18 @@ def admin_stats(request):
             ],
         },
         "needs_assign": qs.filter(stage=Stage.PAID, expert__isnull=True).count(),
+        # Work the client has handed back and is waiting on. Counted from the
+        # open row rather than `revision_rounds`, which never comes back down —
+        # this has to empty as the team resubmits, or it stops being a queue.
+        #
+        # `Exists` rather than `filter(revision_requests__resolved_at__isnull
+        # =True)`: that lookup promotes the join to a LEFT OUTER one, so every
+        # project that has never been sent back matches the NULL as well and
+        # the tile reads as the whole board.
+        "changes_requested": qs.filter(Exists(
+            RevisionRequest.objects.filter(
+                project=OuterRef("pk"), resolved_at__isnull=True)
+        )).count(),
         "contracted_value_usd": sum(p.quote_usd for p in active),
         # Per-discipline breakdown, busiest first.
         "by_line": sorted(by_line.values(), key=lambda r: -r["value_usd"]),

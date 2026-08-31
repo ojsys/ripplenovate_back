@@ -31,6 +31,16 @@ class UserSerializer(serializers.ModelSerializer):
     # from their own people first, but isn't limited to them — an expert can
     # work across teams if they have the capacity.
     on_my_roster = serializers.SerializerMethodField()
+    # The company they actually hold a seat at, as opposed to `company`, which
+    # is free text they typed at signup and nothing verifies. The two come
+    # apart, and only this one answers the question a retainer asks: it bills
+    # to an organisation, so a client without a seat can't hold one. A picker
+    # reading `company` offers people the server will then refuse.
+    organisation_name = serializers.SerializerMethodField()
+
+    def get_organisation_name(self, obj):
+        membership = next(iter(obj.organisation_memberships.all()), None)
+        return membership.organisation.name if membership else ""
 
     def get_active_projects(self, obj):
         from projects.models import Project
@@ -59,6 +69,7 @@ class UserSerializer(serializers.ModelSerializer):
             "is_email_verified", "initials",
             "approval_status", "is_approved", "needs_approval", "is_admin",
             "is_staff", "active_projects", "on_my_roster",
+            "organisation_name",
             "onboarding_step", "onboarding_complete", "rejection_reason",
             "referral_code",
         ]

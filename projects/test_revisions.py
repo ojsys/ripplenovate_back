@@ -158,6 +158,56 @@ class RevisionTests(TestCase):
         self.assertIsNone(detail["open_revision"])
         self.assertEqual(len(detail["revision_history"]), 1)
 
+    # --- finding it again afterwards ---
+    def test_the_board_flags_a_project_the_client_sent_back(self):
+        """The lead's board, not just the notification that announced it.
+
+        A returned project sits at In Progress like any other, so the row read
+        "View" in the same grey as work that was ticking along fine — once the
+        notification was read there was nothing left pointing at it.
+        """
+        self.send_back()
+        row = next(j for j in as_user(self.lead).get("/api/projects").data
+                   if j["id"] == self.project.id)
+        self.assertTrue(row["has_open_revision"])
+        self.assertEqual(row["stage"], Project.Stage.IN_PROGRESS.value)
+
+    def test_the_flag_clears_when_the_team_resubmits(self):
+        self.send_back()
+        as_user(self.expert).post(self.url("/submit-review"))
+        row = next(j for j in as_user(self.lead).get("/api/projects").data
+                   if j["id"] == self.project.id)
+        self.assertFalse(row["has_open_revision"])
+        # The counter stays up — it's the history. The flag is the queue.
+        self.assertEqual(row["revision_rounds"], 1)
+
+    def test_a_project_that_was_never_sent_back_is_not_flagged(self):
+        row = next(j for j in as_user(self.lead).get("/api/projects").data
+                   if j["id"] == self.project.id)
+        self.assertFalse(row["has_open_revision"])
+
+    def test_the_board_stat_counts_what_is_waiting(self):
+        stats = as_user(self.lead).get("/api/projects/stats/admin").data
+        self.assertEqual(stats["changes_requested"], 0)
+        self.send_back()
+        stats = as_user(self.lead).get("/api/projects/stats/admin").data
+        self.assertEqual(stats["changes_requested"], 1)
+        as_user(self.expert).post(self.url("/submit-review"))
+        stats = as_user(self.lead).get("/api/projects/stats/admin").data
+        self.assertEqual(stats["changes_requested"], 0)
+
+    def test_a_second_round_counts_once_not_twice(self):
+        """Two resolved rounds and one open is one project to work on."""
+        self.send_back("Round one.")
+        as_user(self.expert).post(self.url("/submit-review"))
+        self.send_back("Round two.")
+        stats = as_user(self.lead).get("/api/projects/stats/admin").data
+        self.assertEqual(stats["changes_requested"], 1)
+        row = next(j for j in as_user(self.lead).get("/api/projects").data
+                   if j["id"] == self.project.id)
+        self.assertTrue(row["has_open_revision"])
+        self.assertEqual(row["revision_rounds"], 2)
+
     def test_the_client_can_still_approve_after_a_round(self):
         self.send_back()
         as_user(self.expert).post(self.url("/submit-review"))

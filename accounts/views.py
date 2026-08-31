@@ -305,7 +305,9 @@ def user_directory(request):
     role = request.query_params.get("role")
     if role and is_admin:
         qs = qs.filter(role=role)
-    qs = qs.prefetch_related("product_lines").order_by("full_name", "email")[:50]
+    qs = (qs.prefetch_related("product_lines",
+                              "organisation_memberships__organisation")
+            .order_by("full_name", "email")[:50])
     return Response(
         UserSerializer(qs, many=True, context={"viewer": request.user}).data)
 

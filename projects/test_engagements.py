@@ -551,3 +551,72 @@ class SimulatedClockTests(EngagementTestBase):
         _, created = service.run(
             dry_run=True, on=first.period_start + timedelta(days=30))
         self.assertEqual(created, [])
+
+
+class ClientPickerTests(EngagementTestBase):
+    """What the retainer form's client field is allowed to offer.
+
+    The picker used to list every client on the platform from `company` — free
+    text typed at signup that nothing verifies. Creating the retainer then
+    failed on `organisation_memberships`, which is a different question
+    entirely, and the rejection was raised inside a modal that painted over the
+    toast carrying it. The button looked broken; it was the form being refused
+    after the fact.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # Types a company name, holds no seat at one. The old picker showed
+        # this person as though they were ready to buy a retainer.
+        self.stray = User.objects.create_user(
+            "stray@nowhere.io", "x", full_name="Stray Buyer",
+            role=User.Role.CLIENT, company="Looks Like A Company Ltd")
+
+    def directory(self, **params):
+        return as_user(self.lead).get("/api/users", params).data
+
+    def row(self, rows, user):
+        return next(r for r in rows if r["id"] == user.id)
+
+    def test_the_seat_is_reported_not_the_typed_company(self):
+        rows = self.directory(role="client")
+        self.assertEqual(self.row(rows, self.buyer)["organisation_name"], "Acme Ltd")
+        # Free text says otherwise; the field the server checks does not.
+        self.assertEqual(self.row(rows, self.stray)["company"],
+                         "Looks Like A Company Ltd")
+        self.assertEqual(self.row(rows, self.stray)["organisation_name"], "")
+
+    def test_typing_a_name_narrows_the_list(self):
+        rows = self.directory(role="client", q="stray")
+        self.assertEqual([r["id"] for r in rows], [self.stray.id])
+
+    def test_searching_matches_an_email_fragment_too(self):
+        rows = self.directory(role="client", q="enbuyer@")
+        self.assertEqual([r["id"] for r in rows], [self.buyer.id])
+
+    def test_a_lead_searching_never_sees_past_clients(self):
+        """The search must not become a way to enumerate other leads' experts."""
+        rows = self.directory(q="")
+        self.assertEqual({r["role"] for r in rows}, {User.Role.CLIENT.value})
+
+    def test_the_client_the_picker_allows_can_actually_be_set_up(self):
+        response = as_user(self.lead).post("/api/engagements", {
+            "title": "Virtual assistant · 20 hrs",
+            "description": "Inbox, calendar and travel.",
+            "monthly_amount_usd": "1200", "billing_day": 1,
+            "started_on": "2026-09-01", "product_line": self.line.slug,
+            "client": self.buyer.id,
+        }, format="json")
+        self.assertEqual(response.status_code, 201, response.data)
+
+    def test_the_one_it_greys_out_is_the_one_the_server_refuses(self):
+        """The picker's rule and the server's rule are the same rule."""
+        response = as_user(self.lead).post("/api/engagements", {
+            "title": "Virtual assistant · 20 hrs",
+            "description": "Inbox, calendar and travel.",
+            "monthly_amount_usd": "1200", "billing_day": 1,
+            "started_on": "2026-09-01", "product_line": self.line.slug,
+            "client": self.stray.id,
+        }, format="json")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("company", str(response.data).lower())
