@@ -152,10 +152,15 @@ def _mark_paid(payment, raw):
             notifications.notify_change_order_paid(project, order)
         return payment
     if project.stage in (project.Stage.QUOTED, project.Stage.SUBMITTED):
+        from projects import engagements
+
         project.stage = project.Stage.PAID
         project.save(update_fields=["stage"])
         log_activity(project, project.client, "Paid the invoice via Paystack.")
-        notifications.notify_payment_received(project)
+        # A retainer month whose team carried forward goes straight into
+        # delivery; there's nobody to assign, so waiting at Paid only stalls it.
+        started = engagements.start_if_staffed(project)
+        notifications.notify_payment_received(project, started=started)
     return payment
 
 

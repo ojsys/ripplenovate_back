@@ -1,3 +1,5 @@
+from datetime import date
+
 from rest_framework import serializers
 
 from catalog.models import ProductLine, Service
@@ -225,6 +227,32 @@ class ActivitySerializer(serializers.ModelSerializer):
         return _initials(obj.author_name)
 
 
+def task_summary(project):
+    """Where the assigned work stands, counted by task status.
+
+    The stage badge says where the *project* is; this says where the *work* is.
+    A month can sit at In Progress with nothing started, or with everything
+    handed in and waiting on the lead — and without the breakdown the delivery
+    lead can't tell those apart without opening every project. Read from
+    `tasks.all()` so a prefetched list costs no extra query per row.
+    """
+    counts = {s.value: 0 for s in Task.Status}
+    unassigned = 0
+    for t in project.tasks.all():
+        counts[t.status] = counts.get(t.status, 0) + 1
+        if not t.assignee_id and t.status != Task.Status.APPROVED:
+            unassigned += 1
+    total = sum(counts.values())
+    return {
+        "total": total,
+        "todo": counts[Task.Status.TODO],
+        "submitted": counts[Task.Status.SUBMITTED],
+        "changes": counts[Task.Status.CHANGES],
+        "approved": counts[Task.Status.APPROVED],
+        "unassigned": unassigned,
+    }
+
+
 class ProjectListSerializer(serializers.ModelSerializer):
     expert_name = serializers.SerializerMethodField()
     product_line = ProductLineBriefSerializer(read_only=True)
@@ -243,6 +271,7 @@ class ProjectListSerializer(serializers.ModelSerializer):
     # returned project is just another "In Progress" row, and the only thing
     # that ever said otherwise was a notification.
     has_open_revision = serializers.SerializerMethodField()
+    task_summary = serializers.SerializerMethodField()
 
     class Meta:
         model = Project
@@ -251,7 +280,10 @@ class ProjectListSerializer(serializers.ModelSerializer):
             "quote_usd", "expert", "expert_name", "progress_pct", "is_paid",
             "target_date", "created_at", "product_line", "service_name",
             "is_overdue", "days_overdue", "is_on_time", "days_late",
-            "revision_rounds", "has_open_revision",
+            "revision_rounds", "has_open_revision", "task_summary",
+            # Which retainer this month belongs to, if any — so the board can
+            # tell a recurring month from a one-off brief.
+            "engagement", "period_start", "period_end",
         ]
         # Output only. Lifecycle fields are moved by the viewset's actions (which
         # log activity and notify), never written straight from a request body.
@@ -259,8 +291,11 @@ class ProjectListSerializer(serializers.ModelSerializer):
             "code", "title", "company", "category", "stage", "quote_usd",
             "expert", "target_date", "created_at", "product_line", "service_name",
             "is_overdue", "days_overdue", "is_on_time", "days_late",
-            "revision_rounds",
+            "revision_rounds", "engagement", "period_start", "period_end",
         ]
+
+    def get_task_summary(self, obj):
+        return task_summary(obj)
 
     def get_service_name(self, obj):
         return obj.service.name if obj.service else obj.category
@@ -592,13 +627,33 @@ class ActivityCreateSerializer(serializers.Serializer):
 
 
 class EngagementCycleSerializer(serializers.ModelSerializer):
-    """One month of a retainer, as the client and lead see it in a list."""
+    """One month of a retainer, as the client and lead see it in a list.
+
+    Carries the work, not just the bill: who is on it and where each task
+    stands. A lead running six retainers otherwise has to open every month to
+    find out whether anything has been started.
+    """
+
+    task_summary = serializers.SerializerMethodField()
+    team = serializers.SerializerMethodField()
+    is_overdue = serializers.BooleanField(read_only=True)
+    has_open_revision = serializers.SerializerMethodField()
 
     class Meta:
         model = Project
         fields = ["id", "code", "title", "stage", "quote_usd", "is_paid",
-                  "period_start", "period_end", "progress_pct"]
+                  "period_start", "period_end", "progress_pct",
+                  "task_summary", "team", "is_overdue", "has_open_revision"]
         read_only_fields = fields
+
+    def get_task_summary(self, obj):
+        return task_summary(obj)
+
+    def get_team(self, obj):
+        return [e.full_name or e.email for e in obj.experts.all()]
+
+    def get_has_open_revision(self, obj):
+        return obj.open_revision is not None
 
 
 class EngagementSerializer(serializers.ModelSerializer):
@@ -631,8 +686,11 @@ class EngagementSerializer(serializers.ModelSerializer):
         return obj.lead.full_name or obj.lead.email
 
     def get_cycles(self, obj):
-        return EngagementCycleSerializer(
-            obj.cycles.order_by("-period_start"), many=True).data
+        # Sorted in Python so the prefetched cycles (and their tasks and team)
+        # are used; `order_by` here would throw the prefetch away.
+        cycles = sorted(obj.cycles.all(), key=lambda c: c.period_start or date.min,
+                        reverse=True)
+        return EngagementCycleSerializer(cycles, many=True).data
 
     def get_next_period_start(self, obj):
         """What the client would be billed for next, or null if nothing is due.

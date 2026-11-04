@@ -620,3 +620,173 @@ class ClientPickerTests(EngagementTestBase):
         }, format="json")
         self.assertEqual(response.status_code, 400)
         self.assertIn("company", str(response.data).lower())
+
+
+class CycleWorkflowTests(EngagementTestBase):
+    """The month-to-month workflow: what carries forward, and what moves on."""
+
+    def _staffed_month(self, period=date(2026, 3, 1)):
+        e = self.engagement(amount="1000")
+        first = service.generate_cycle(e, period)
+        first.experts.add(self.va)
+        first.expert = self.va
+        first.stage = Project.Stage.COMPLETED
+        first.save(update_fields=["expert", "stage"])
+        return e, first
+
+    def _pay(self, project):
+        from payments import paystack
+        from payments.models import Payment
+
+        payment = Payment.objects.create(
+            project=project, gateway="paystack", reference=f"RIL-{project.id}",
+            access_code="x", amount_subunit=100000, currency="USD",
+            usd_total=Decimal(project.quote_usd), status=Payment.Status.PENDING)
+        paystack._mark_paid(payment, {})
+        project.refresh_from_db()
+        return project
+
+    # -- carry forward -------------------------------------------------------
+
+    def test_tasks_carry_forward_as_fresh_to_dos(self):
+        e, first = self._staffed_month()
+        Task.objects.create(project=first, title="Inbox zero", assignee=self.va,
+                            amount_usd=Decimal("300"), status=Task.Status.APPROVED,
+                            order=0)
+        Task.objects.create(project=first, title="Weekly report", assignee=self.va,
+                            amount_usd=Decimal("200"), status=Task.Status.SUBMITTED,
+                            order=1)
+        nxt = service.generate_cycle(e, date(2026, 4, 1))
+        tasks = list(nxt.tasks.order_by("order"))
+        self.assertEqual([t.title for t in tasks], ["Inbox zero", "Weekly report"])
+        self.assertTrue(all(t.status == Task.Status.TODO for t in tasks))
+        self.assertTrue(all(t.assignee_id == self.va.id for t in tasks))
+        self.assertEqual([t.amount_usd for t in tasks],
+                         [Decimal("300.00"), Decimal("200.00")])
+
+    def test_prices_that_no_longer_fit_carry_unpriced(self):
+        e, first = self._staffed_month()
+        # Last month had extra scope; this month's pool is only $700.
+        Task.objects.create(project=first, title="Big", assignee=self.va,
+                            amount_usd=Decimal("900"))
+        nxt = service.generate_cycle(e, date(2026, 4, 1))
+        task = nxt.tasks.get()
+        self.assertEqual(task.amount_usd, Decimal("0"))
+        self.assertLessEqual(nxt.allocated_usd, nxt.expert_pool_usd)
+
+    def test_the_referrer_and_share_terms_carry_forward(self):
+        bd = User.objects.create_user("enbd@ril.team", "x",
+                                      role=User.Role.BUSINESS_DEV)
+        self.buyer.referred_by = bd
+        self.buyer.save(update_fields=["referred_by"])
+        e = self.engagement()
+        first = service.generate_cycle(e, date(2026, 3, 1))
+        self.assertEqual(first.business_developer, bd)
+        first.expert_share_percent = Decimal("65")
+        first.save(update_fields=["expert_share_percent"])
+        nxt = service.generate_cycle(e, date(2026, 4, 1))
+        self.assertEqual(nxt.business_developer, bd)
+        self.assertEqual(nxt.expert_share_percent, Decimal("65.00"))
+
+    # -- paying starts the month ---------------------------------------------
+
+    def test_paying_a_staffed_month_starts_delivery(self):
+        e, _ = self._staffed_month()
+        nxt = self._pay(service.generate_cycle(e, date(2026, 4, 1)))
+        self.assertEqual(nxt.stage, Project.Stage.IN_PROGRESS)
+        self.assertTrue(any("underway" in m.subject for m in mail.outbox))
+
+    def test_paying_an_unstaffed_month_waits_for_assignment(self):
+        e = self.engagement()
+        first = self._pay(service.generate_cycle(e, date(2026, 3, 1)))
+        self.assertEqual(first.stage, Project.Stage.PAID)
+
+    def test_a_one_off_brief_still_waits_at_paid(self):
+        brief = Project.objects.create(
+            title="One-off", client=self.buyer, organisation=self.org,
+            category="VA", description="…", product_line=self.line,
+            lead=self.lead, expert=self.va, stage=Project.Stage.QUOTED,
+            quote_usd=500)
+        brief.experts.add(self.va)
+        self.assertEqual(self._pay(brief).stage, Project.Stage.PAID)
+
+    def test_a_lead_can_start_a_month_stuck_at_paid(self):
+        e, _ = self._staffed_month()
+        nxt = service.generate_cycle(e, date(2026, 4, 1))
+        nxt.stage = Project.Stage.PAID
+        nxt.save(update_fields=["stage"])
+        resp = as_user(self.lead).post(f"/api/projects/{nxt.id}/start")
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertEqual(resp.data["stage"], "In Progress")
+
+    def test_start_refuses_without_a_team_or_payment(self):
+        e = self.engagement()
+        cycle = service.generate_cycle(e, date(2026, 3, 1))
+        url = f"/api/projects/{cycle.id}/start"
+        self.assertEqual(as_user(self.lead).post(url).status_code, 400)  # unpaid
+        cycle.stage = Project.Stage.PAID
+        cycle.save(update_fields=["stage"])
+        self.assertEqual(as_user(self.lead).post(url).status_code, 400)  # no team
+
+    # -- the lead can see the work -------------------------------------------
+
+    def test_the_lead_sees_where_each_months_work_stands(self):
+        e, first = self._staffed_month()
+        for status in (Task.Status.TODO, Task.Status.SUBMITTED,
+                       Task.Status.CHANGES, Task.Status.APPROVED):
+            Task.objects.create(project=first, title=status, assignee=self.va,
+                                status=status)
+        Task.objects.create(project=first, title="Nobody's", status=Task.Status.TODO)
+        data = as_user(self.lead).get(f"/api/engagements/{e.id}").data
+        month = data["cycles"][0]
+        self.assertEqual(month["task_summary"], {
+            "total": 5, "todo": 2, "submitted": 1, "changes": 1,
+            "approved": 1, "unassigned": 1})
+        self.assertEqual(month["team"], ["A VA"])
+
+    def test_the_board_carries_the_task_breakdown(self):
+        e, first = self._staffed_month()
+        Task.objects.create(project=first, title="t", assignee=self.va,
+                            status=Task.Status.SUBMITTED)
+        row = next(r for r in as_user(self.lead).get("/api/projects").data
+                   if r["id"] == first.id)
+        self.assertEqual(row["task_summary"]["submitted"], 1)
+        self.assertEqual(row["engagement"], e.id)
+
+    # -- ending --------------------------------------------------------------
+
+    def test_ending_withdraws_the_unpaid_month(self):
+        e, first = self._staffed_month()
+        nxt = service.generate_cycle(e, date(2026, 4, 1))
+        mail.outbox.clear()
+        as_user(self.lead).post(f"/api/engagements/{e.id}",
+                                {"action": "end", "reason": "In-house now."},
+                                format="json")
+        nxt.refresh_from_db()
+        first.refresh_from_db()
+        self.assertEqual(nxt.stage, Project.Stage.CANCELLED)
+        self.assertEqual(first.stage, Project.Stage.COMPLETED)
+        ended = next(m for m in mail.outbox if "Retainer ended" in m.subject)
+        body = ended.body + "".join(a[0] for a in getattr(ended, "alternatives", []))
+        self.assertIn("withdrawn", body)
+        self.assertNotIn("it's paid for", body)
+
+    # -- lead changes --------------------------------------------------------
+
+    def test_a_lead_change_on_a_month_moves_the_retainer(self):
+        from projects.models import LeadChangeRequest
+
+        e = self.engagement()
+        cycle = service.generate_cycle(e, date(2026, 3, 1))
+        entry = LeadChangeRequest.objects.create(
+            project=cycle, requested_by=self.buyer, reason="Unresponsive.",
+            previous_lead=self.lead)
+        resp = as_user(self.admin).post(
+            f"/api/lead-changes/{entry.id}/resolve",
+            {"decision": "reassign", "new_lead": self.other_lead.id},
+            format="json")
+        self.assertEqual(resp.status_code, 200, resp.data)
+        e.refresh_from_db()
+        self.assertEqual(e.lead, self.other_lead)
+        nxt = service.generate_cycle(e, date(2026, 4, 1))
+        self.assertEqual(nxt.lead, self.other_lead)

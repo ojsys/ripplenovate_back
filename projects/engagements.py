@@ -23,11 +23,12 @@ cycle.
 import calendar
 import logging
 from datetime import date, timedelta
+from decimal import Decimal
 
 from django.db import transaction
 from django.utils import timezone
 
-from .models import CycleRun, Engagement, Project
+from .models import CycleRun, Engagement, Project, Task
 
 logger = logging.getLogger("ripple")
 
@@ -140,7 +141,11 @@ def generate_cycle(engagement, period_start=None):
         return None
 
     period_end = period_end_for(engagement, period_start)
-    previous = engagement.cycles.order_by("-period_start").first()
+    # The last month that actually ran. A month cancelled unpaid (the retainer
+    # was paused and its pending invoice withdrawn, say) says nothing about who
+    # does the work or what it's made of, so it's skipped as a template.
+    previous = (engagement.cycles.exclude(stage=Project.Stage.CANCELLED)
+                .order_by("-period_start").first())
 
     cycle = Project.objects.create(
         engagement=engagement,
@@ -161,6 +166,18 @@ def generate_cycle(engagement, period_start=None):
         stage=Project.Stage.QUOTED,
         quote_usd=int(engagement.monthly_amount_usd),
         target_date=period_end,
+        # Money terms carry forward exactly as they were agreed. Without this
+        # every month after the first silently reverted to site defaults, and
+        # the business developer who brought the client in — credited on every
+        # one-off brief through the same referral — earned nothing on a
+        # retainer at all.
+        business_developer=(previous.business_developer if previous
+                            else engagement.client.referred_by),
+        expert_share_percent=previous.expert_share_percent if previous else None,
+        delivery_lead_share_percent=(previous.delivery_lead_share_percent
+                                     if previous else None),
+        business_dev_share_percent=(previous.business_dev_share_percent
+                                    if previous else None),
     )
 
     # The team carries forward. A lead staffs the first cycle through the
@@ -171,8 +188,98 @@ def generate_cycle(engagement, period_start=None):
             cycle.experts.set(team)
             cycle.expert = previous.expert if previous.expert in team else team[0]
             cycle.save(update_fields=["expert"])
+        _carry_tasks(previous, cycle, team)
 
     return cycle
+
+
+def _carry_tasks(previous, cycle, team):
+    """Copy last month's task list into this one, as fresh to-dos.
+
+    A retainer is the same work every month; making the lead retype the list
+    each time is how a month ends up with nothing on it and nobody able to see
+    what's been done. Status never carries — every task starts at To do, so no
+    approval (and no money) leaks from one month into the next.
+
+    Prices carry only if they still fit this month's expert pool. Last month
+    may have had paid extra scope that this one doesn't, and the allocation
+    invariant — never promise out more than was taken in — is not something a
+    scheduled job gets to bend. If they don't fit, the list carries unpriced
+    and the lead re-prices it.
+    """
+    tasks = list(previous.tasks.order_by("order", "id"))
+    if not tasks:
+        return
+    on_team = {e.id for e in team}
+    total = sum((t.amount_usd for t in tasks), Decimal("0"))
+    keep_prices = total <= cycle.expert_pool_usd
+    Task.objects.bulk_create([
+        Task(
+            project=cycle,
+            title=t.title,
+            description=t.description,
+            assignee_id=t.assignee_id if t.assignee_id in on_team else None,
+            amount_usd=t.amount_usd if keep_prices else Decimal("0"),
+            order=t.order,
+        )
+        for t in tasks
+    ])
+
+
+def start_if_staffed(cycle, actor=None):
+    """Kick a freshly paid cycle straight into delivery if it has a team.
+
+    A brief waits at Paid for a lead to staff it. A retainer month usually
+    doesn't need to — its team carried forward from last month — but nothing
+    moved it on, and the whole platform reads Paid as "nobody has started":
+    experts' My Work skipped it, progress ignored its tasks, and the board
+    offered the lead no action because an expert was already named. Each month
+    sat stalled until somebody noticed.
+
+    Returns True if it started the cycle.
+    """
+    from . import notifications
+    from .views import log_activity
+
+    if (not cycle.engagement_id or cycle.stage != Project.Stage.PAID
+            or not cycle.expert_id):
+        return False
+    cycle.stage = Project.Stage.IN_PROGRESS
+    cycle.save(update_fields=["stage"])
+    team = list(cycle.experts.all())
+    author = actor or cycle.lead or cycle.client
+    log_activity(cycle, author,
+                 f"{cycle.period_start:%B}'s team carried forward — delivery has started.")
+    try:
+        notifications.notify_experts_assigned(cycle, team)
+    except Exception as exc:  # noqa: BLE001 — payment must not fail on email
+        logger.error("kickoff notification for %s failed: %s", cycle.code, exc)
+    return True
+
+
+def withdraw_unpaid_cycles(engagement, actor, reason):
+    """Cancel every month that was raised but never paid.
+
+    Run when a retainer ends. Cycles are raised a week ahead, so ending one
+    almost always leaves next month's invoice sitting open — still payable,
+    for a retainer that no longer exists. Nothing has been done on an unpaid
+    cycle (work can't start before payment), so there is nothing to refund
+    and nothing to deliver.
+    """
+    from .views import log_activity
+
+    withdrawn = []
+    for cycle in engagement.cycles.filter(stage=Project.Stage.QUOTED):
+        cycle.stage = Project.Stage.CANCELLED
+        cycle.cancelled_at = timezone.now()
+        cycle.cancelled_by = actor
+        cycle.cancellation_reason = f"Retainer ended: {reason}"
+        cycle.save(update_fields=["stage", "cancelled_at", "cancelled_by",
+                                  "cancellation_reason"])
+        log_activity(cycle, actor,
+                     "Withdrew this unpaid month — the retainer has ended.")
+        withdrawn.append(cycle)
+    return withdrawn
 
 
 def run(*, dry_run=False, on=None, limit=MAX_PER_RUN, triggered_by=""):

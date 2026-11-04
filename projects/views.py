@@ -504,6 +504,32 @@ class ProjectViewSet(mixins.ListModelMixin,
         notifications.notify_experts_assigned(project, experts)
         return self._detail(project)
 
+    @action(detail=True, methods=["post"])
+    def start(self, request, pk=None):
+        """Start delivery on a paid project whose team is already in place.
+
+        The case is a retainer month: its team carried forward, so `assign`
+        (which builds a team) and `experts` (which adds to one) both had
+        nothing to do, and the month sat at Paid with no way on. Paying now
+        starts these automatically; this is the lead's hand on the same lever,
+        for months paid before that, or staffed after payment by an admin.
+        """
+        project = self.get_object()
+        self._require_lead()
+        if project.stage != Stage.PAID:
+            raise ValidationError("Only a paid project waiting to start can be started.")
+        team = list(project.experts.all())
+        if not team:
+            raise ValidationError("Put a team on it first.")
+        if not project.expert_id or project.expert not in team:
+            project.expert = team[0]
+        project.stage = Stage.IN_PROGRESS
+        project.save(update_fields=["stage", "expert"])
+        log_activity(project, request.user,
+                     f"Started delivery with {self._names(team)}.")
+        notifications.notify_experts_assigned(project, team)
+        return self._detail(project)
+
     @action(detail=True, methods=["post"], url_path="tasks")
     def create_task(self, request, pk=None):
         """Add a task to the list, optionally priced and assigned."""
@@ -1774,7 +1800,8 @@ def _visible_engagements(user):
     """
     base = Engagement.objects.select_related(
         "organisation", "client", "lead", "product_line", "service"
-    ).prefetch_related("cycles")
+    ).prefetch_related("cycles", "cycles__tasks", "cycles__experts",
+                       "cycles__revision_requests")
     if user.is_superuser:
         return base
     if user.role == Role.DELIVERY_LEAD:
@@ -1857,9 +1884,16 @@ def engagement_detail(request, engagement_id):
         engagement.end_reason = reason
         engagement.save(update_fields=["status", "ended_at", "end_reason"])
         # A month already paid for is delivered. Ending stops future billing;
-        # it does not cancel work the client has settled.
-        latest = engagement.cycles.order_by("-period_start").first()
-        notifications.notify_engagement_ended(engagement, final_cycle=latest)
+        # it does not cancel work the client has settled. A month raised but
+        # not paid is withdrawn — otherwise it stays payable for a retainer
+        # that no longer exists.
+        from . import engagements as service
+
+        withdrawn = service.withdraw_unpaid_cycles(engagement, request.user, reason)
+        latest = (engagement.cycles.exclude(stage=Stage.CANCELLED)
+                  .order_by("-period_start").first())
+        notifications.notify_engagement_ended(
+            engagement, final_cycle=latest, withdrawn=withdrawn)
     elif action_name == "raise-cycle":
         # The manual path, for a retainer set up mid-month that shouldn't wait
         # for the scheduler. It skips only the lead-time window — every other
@@ -2033,6 +2067,19 @@ def resolve_lead_change(request, pk):
             f"Moved the project to {successor.full_name or successor.email} "
             "as its delivery lead.",
         )
+        # On a retainer the client is asking to move the relationship, not one
+        # month of it. Leaving the engagement behind meant next month's cycle
+        # was raised straight back to the lead they asked to move away from,
+        # and that lead kept running the retainer page.
+        engagement = project.engagement
+        if engagement and engagement.lead_id == entry.previous_lead_id:
+            engagement.lead = successor
+            engagement.save(update_fields=["lead"])
+            (engagement.cycles
+             .filter(lead_id=entry.previous_lead_id)
+             .exclude(stage__in=Project.CLOSED_STAGES)
+             .exclude(pk=project.pk)
+             .update(lead=successor))
     else:
         raise ValidationError("Decide either reassign or decline.")
 

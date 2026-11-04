@@ -5,13 +5,16 @@ Flow, per Paystack's API:
     1. resolve  — check the account number really belongs to that name
     2. recipient — register the account once, reuse the recipient code after
     3. transfer  — send the money; Paystack answers `success`, `pending`, or `otp`
-    4. confirm   — a `transfer.success` / `transfer.failed` webhook (or a verify
-                   call) is the source of truth for the final state
+    4. confirm   — a verify call is the source of truth for the final state.
+                   We don't receive transfer webhooks (the Paystack account is
+                   shared with other products, and it has one webhook URL), so
+                   `reconcile` asks — on a schedule, and whenever anyone looks.
 
 A withdrawal is only marked paid on Paystack's confirmation, never on the fact
 that we asked. Anything that fails puts the amount back in the earner's balance.
 """
 import logging
+from datetime import timedelta
 
 import requests
 from django.conf import settings
@@ -118,9 +121,13 @@ def _apply_transfer_state(withdrawal, body, actor=None):
     withdrawal.transfer_raw = body
 
     if state == "success":
+        # Re-confirming a payout already paid keeps the time it first landed;
+        # moving it would rewrite history, and keep the scheduled sync's
+        # reversal window from ever closing on it.
+        if withdrawal.status != Withdrawal.Status.PAID or not withdrawal.processed_at:
+            withdrawal.processed_at = timezone.now()
         withdrawal.status = Withdrawal.Status.PAID
         withdrawal.failure_reason = ""
-        withdrawal.processed_at = timezone.now()
     elif state in ("failed", "reversed", "abandoned"):
         withdrawal.status = Withdrawal.Status.FAILED
         withdrawal.failure_reason = (
@@ -174,6 +181,71 @@ def verify(withdrawal):
     ref = withdrawal.transfer_reference or withdrawal.reference
     body = _get(f"/transfer/verify/{ref}")
     return _apply_transfer_state(withdrawal, body)
+
+
+# How often one payout may be re-checked with Paystack on its own initiative.
+# Every Earnings page load reconciles, so without a floor a lead refreshing
+# would hammer the verify endpoint.
+RECONCILE_INTERVAL_SECONDS = 20
+RECONCILE_CACHE_KEY = "ril:payout:reconciled:{}"
+
+# How far back the scheduled sync re-checks payouts already marked paid. A
+# transfer Paystack reported as successful can still be reversed by the bank
+# a day or two later; with no webhook, asking again is the only way to hear.
+REVERSAL_WINDOW_DAYS = 3
+
+
+def reconcile(withdrawals, throttle=True):
+    """Ask Paystack where each payout stands, and apply the answer. Never raises.
+
+    **This is how payouts settle.** The Paystack account is shared with other
+    products, and Paystack allows one webhook URL per account, so this platform
+    does not receive transfer webhooks at all. Verify is the same source of
+    truth asked directly: the scheduled `sync_payouts` job runs this every few
+    minutes, every Earnings page load runs it for what's on screen, and the
+    settle modal polls it while the lead watches.
+
+    Only payouts that have actually been handed to Paystack are asked about.
+    `throttle` stops page refreshes re-asking about the same payout within
+    RECONCILE_INTERVAL_SECONDS; the scheduled job passes False.
+
+    Returns the withdrawals whose status changed. Notifies the earner for any
+    that settled or failed.
+    """
+    from . import notifications  # local: notifications imports models
+
+    changed = []
+    for w in withdrawals:
+        if w.status not in (Withdrawal.Status.PROCESSING, Withdrawal.Status.PAID):
+            continue
+        if not (w.transfer_reference or w.transfer_code):
+            continue  # recorded by hand, or never sent — nothing to ask
+        if throttle and not cache.add(RECONCILE_CACHE_KEY.format(w.pk), 1,
+                                      RECONCILE_INTERVAL_SECONDS):
+            continue  # checked moments ago
+        before = w.status
+        try:
+            verify(w)
+        except Exception as exc:  # noqa: BLE001 — one bad payout mustn't stop the rest
+            logger.warning("payout reconcile for %s failed: %s", w.reference, exc)
+            continue
+        if w.status != before:
+            changed.append(w)
+            logger.info("payout %s: %s -> %s", w.reference, before, w.status)
+            if w.status != Withdrawal.Status.PROCESSING:
+                notifications.notify_withdrawal_settled(w)
+    return changed
+
+
+def sync_all():
+    """The scheduled job's whole body: every payout still in flight, plus
+    recently paid ones in case the bank reversed them."""
+    since = timezone.now() - timedelta(days=REVERSAL_WINDOW_DAYS)
+    in_flight = Withdrawal.objects.filter(status=Withdrawal.Status.PROCESSING)
+    recent = Withdrawal.objects.filter(status=Withdrawal.Status.PAID,
+                                       processed_at__gte=since)
+    rows = list((in_flight | recent).select_related("user").order_by("id"))
+    return rows, reconcile(rows, throttle=False)
 
 
 def finalize(withdrawal, otp):

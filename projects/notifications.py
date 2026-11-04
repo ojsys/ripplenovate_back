@@ -114,18 +114,37 @@ def notify_quote_sent(project):
 
 
 @_safe
-def notify_payment_received(project):
+def notify_payment_received(project, started=False):
+    """`started` is a retainer month that went straight into delivery because
+    its team carried forward — there is nobody to assign, so the lead is told
+    it's running rather than asked to kick it off."""
     send_brand_email(
         subject=f"Payment received for {project.title}",
         to=project.client.email,
         heading="Payment received — thank you!",
         paragraphs=[
             f"We've received your payment for “{project.title}”.",
-            "An expert will be assigned and work begins shortly. Your funds are held securely and only "
-            "released to the talent once you approve the delivered work.",
+            ("Your team is already on it — work for this month has started."
+             if started else
+             "An expert will be assigned and work begins shortly.")
+            + " Your funds are held securely and only released to the talent "
+            "once you approve the delivered work.",
         ],
         cta=("Track your project", _project_url(project)),
     )
+    if started:
+        send_brand_email(
+            subject=f"Paid & underway: {project.title}",
+            to=_project_lead_email(project) or _intake_lead_emails(project),
+            heading="A retainer month is paid and running",
+            paragraphs=[
+                f"“{project.title}” ({project.company}) has been paid. Last month's "
+                "team and task list carried forward, so delivery has started. "
+                "Check the task list and pricing are right for this month.",
+            ],
+            cta=("Open the month", _project_url(project)),
+        )
+        return
     send_brand_email(
         subject=f"Paid & ready to assign: {project.title}",
         to=_project_lead_email(project) or _intake_lead_emails(project),
@@ -714,8 +733,14 @@ def notify_cycle_raised(cycle):
 
 
 @_safe
-def notify_engagement_ended(engagement, final_cycle=None):
-    """Tell everyone a retainer has stopped, and what happens to the last month."""
+def notify_engagement_ended(engagement, final_cycle=None, withdrawn=()):
+    """Tell everyone a retainer has stopped, and what happens to the last month.
+
+    `final_cycle` is the latest month that is still standing; `withdrawn` are
+    the unpaid ones cancelled as the retainer ended. Only a paid month is
+    promised as "paid for and will be delivered" — saying that about an open
+    invoice is how a client ends up paying for a month nobody will work.
+    """
     recipients = {engagement.client.email}
     if engagement.lead_id and engagement.lead:
         recipients.add(engagement.lead.email)
@@ -727,7 +752,13 @@ def notify_engagement_ended(engagement, final_cycle=None):
     ]
     if engagement.end_reason:
         paragraphs.append(f"Reason given: “{engagement.end_reason}”")
-    if final_cycle and final_cycle.stage not in Project.CLOSED_STAGES:
+    if withdrawn:
+        months = ", ".join(f"{c.period_start:%B %Y}" for c in withdrawn)
+        paragraphs.append(
+            f"The unpaid invoice for {months} has been withdrawn — there is "
+            "nothing to pay.")
+    if (final_cycle and final_cycle.is_paid
+            and final_cycle.stage not in Project.CLOSED_STAGES):
         paragraphs.append(
             f"The current month runs to {final_cycle.period_end:%-d %B} and is "
             "unaffected — it's paid for, and it will be delivered."
