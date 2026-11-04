@@ -340,6 +340,26 @@ def settle(withdrawal, status, actor, note="", manual=False):
             f"This request is already {withdrawal.get_status_display().lower()}."
         )
 
+    in_flight = (withdrawal.status == Withdrawal.Status.PROCESSING
+                 and bool(withdrawal.transfer_code or withdrawal.transfer_reference))
+    if in_flight and status == Withdrawal.Status.REJECTED:
+        # Rejecting returns the amount to their balance. With a transfer
+        # already on its way that's paying them twice — once to the bank, once
+        # back into the account they can withdraw from again.
+        raise WithdrawalError(
+            "This payout is already on its way through Paystack, so it can't be "
+            "rejected. Check its status — if the transfer fails, the amount "
+            "returns to their balance on its own."
+        )
+    if in_flight and status == Withdrawal.Status.PAID and not manual:
+        # Pressing "send" again on a payout that's sending is asking whether
+        # it landed. Sending a second transfer would be the wrong answer.
+        try:
+            transfers.verify(withdrawal)
+        except PaystackError as exc:
+            raise WithdrawalError(str(exc))
+        return withdrawal
+
     sending = (status == Withdrawal.Status.PAID and not manual
                and transfers.transfers_enabled())
     if sending:

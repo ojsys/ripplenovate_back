@@ -180,6 +180,13 @@ def earnings(request):
     """The signed-in earner's balance, ledger, and payout history."""
     user = request.user
     _require_earner(user)
+    # Settle anything Paystack has finished with before reading balances, so
+    # the page never shows "Sending" for money that has already landed.
+    sending = Withdrawal.objects.filter(status=Withdrawal.Status.PROCESSING)
+    if not (user.role == user.Role.DELIVERY_LEAD or user.is_superuser):
+        sending = sending.filter(user=user)
+    if transfers.transfers_enabled():
+        transfers.reconcile(sending.select_related("user"))
     summary = earnings_service.summary(user)
     currency = settings.PAYSTACK_CURRENCY
     payload = {
