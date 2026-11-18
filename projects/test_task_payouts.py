@@ -118,7 +118,27 @@ class TaskPayoutModelTests(TestCase):
         self.task(title="Two", status=Task.Status.APPROVED)
         self.task(title="Three")
         self.task(title="Four")
-        self.assertEqual(self.project.progress_pct, 50)
+        # Halfway through the In Progress band (60% → 80%).
+        self.assertEqual(self.project.progress_pct, 70)
+
+    def test_adding_tasks_never_drops_progress_below_the_stage(self):
+        self.project.stage = Project.Stage.IN_PROGRESS
+        before = self.project.progress_pct
+        self.task()
+        self.assertEqual(self.project.progress_pct, before)
+
+    def test_submitted_work_moves_the_bar(self):
+        self.project.stage = Project.Stage.IN_PROGRESS
+        self.task(status=Task.Status.SUBMITTED)
+        self.task(title="Two")
+        self.assertEqual(self.project.progress_pct, 65)
+
+    def test_review_never_reads_lower_than_in_progress(self):
+        self.project.stage = Project.Stage.REVIEW
+        self.task()
+        self.assertEqual(self.project.progress_pct, 80)
+        self.project.tasks.update(status=Task.Status.APPROVED)
+        self.assertEqual(self.project.progress_pct, 95)
 
 
 class LegacyPayoutTests(TestCase):

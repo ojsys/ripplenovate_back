@@ -573,9 +573,21 @@ class Project(models.Model):
             return round(self.STAGE_ORDER.index(self.Stage.PAID) / 5 * 100) if self.is_paid else 0
         if self.stage == self.Stage.COMPLETED:
             return 100
+        # Tasks move the bar *within* a stage's band; they never replace the
+        # stage. Replacing it (the old `done / total`) meant adding a task list
+        # dropped a project from 60% to 0%, a project in Review could read lower
+        # than one still In Progress, and handed-in work showed nothing until a
+        # lead approved it — so the client saw a bar that never moved.
+        base = round(self.stage_index / 5 * 100)
         if total and self.stage in {self.Stage.IN_PROGRESS, self.Stage.REVIEW}:
-            return round(done / total * 100)
-        return round(self.stage_index / 5 * 100)
+            submitted = sum(1 for t in tasks if t.status == Task.Status.SUBMITTED)
+            # Handed in counts for half: it's real movement, but not yet checked.
+            work = (done + 0.5 * submitted) / total
+            span = 20  # one stage's worth of the bar
+            # Only Completed reads 100%, so Review tops out just below it.
+            cap = 95 if self.stage == self.Stage.REVIEW else base + span
+            return min(cap, round(base + work * span))
+        return base
 
 
 class Task(models.Model):
